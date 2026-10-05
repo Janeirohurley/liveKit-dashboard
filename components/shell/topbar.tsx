@@ -1,8 +1,9 @@
 "use client"
 
 import Link from "next/link"
+import { useMemo, useState } from "react"
 import { usePathname, useRouter } from "next/navigation"
-import { Bell, Command, Search, LogOut, User2, Languages, ServerCog, Menu } from "lucide-react"
+import { Command, Search, LogOut, User2, Languages, ServerCog, Menu } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Sheet, SheetContent, SheetTrigger, SheetTitle, SheetDescription } from "@/components/ui/sheet"
@@ -19,6 +20,7 @@ import { Kbd } from "@/components/ui/kbd"
 import { cn } from "@/lib/utils"
 import { useI18n } from "@/lib/i18n"
 import { LayoutDashboard, Radio, KeyRound, Activity, ScrollText, Settings } from "lucide-react"
+import type { AdminIdentity } from "@/lib/auth/session"
 
 const items = [
   { href: "/dashboard", icon: LayoutDashboard, key: "nav.dashboard" },
@@ -29,10 +31,41 @@ const items = [
   { href: "/settings", icon: Settings, key: "nav.settings" },
 ] as const
 
-export function Topbar({ onCommandPalette }: { onCommandPalette?: () => void }) {
+export function Topbar({
+  identity,
+  onCommandPalette,
+}: {
+  identity: AdminIdentity
+  onCommandPalette?: () => void
+}) {
   const { t, locale, setLocale } = useI18n()
   const router = useRouter()
   const pathname = usePathname()
+  const [loggingOut, setLoggingOut] = useState(false)
+
+  const initials = useMemo(() => {
+    const source = identity.name.trim() || identity.email
+    const parts = source.split(/[\s@._-]+/).filter(Boolean)
+    if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase()
+    return source.slice(0, 2).toUpperCase()
+  }, [identity.name, identity.email])
+
+  async function handleLogout() {
+    if (loggingOut) return
+    setLoggingOut(true)
+    try {
+      const res = await fetch("/api/auth/logout", { method: "POST" })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch {
+      // A failed logout must not leave the operator stranded: report it and let
+      // them retry rather than navigating away while the session is still live.
+      setLoggingOut(false)
+      alert(t("common.logoutFailed"))
+      return
+    }
+    router.replace("/login")
+    router.refresh()
+  }
 
   return (
     <header className="sticky top-0 z-30 h-16 border-b border-border bg-background/70 backdrop-blur-xl">
@@ -120,12 +153,7 @@ export function Topbar({ onCommandPalette }: { onCommandPalette?: () => void }) 
             </DropdownMenuContent>
           </DropdownMenu>
 
-          <Button variant="ghost" size="icon" aria-label="Notifications" className="relative">
-            <Bell className="size-4" />
-            <span className="absolute top-1.5 end-1.5 size-1.5 rounded-full bg-destructive" />
-          </Button>
-
-          <Button variant="ghost" size="icon" onClick={onCommandPalette} aria-label="Command palette">
+          <Button variant="ghost" size="icon" onClick={onCommandPalette} aria-label={t("common.search")}>
             <Command className="size-4" />
           </Button>
 
@@ -133,11 +161,13 @@ export function Topbar({ onCommandPalette }: { onCommandPalette?: () => void }) 
             <DropdownMenuTrigger asChild>
               <Button variant="ghost" className="h-9 px-2 gap-2">
                 <Avatar className="size-7">
-                  <AvatarFallback className="bg-primary/15 text-primary text-xs font-semibold">OP</AvatarFallback>
+                  <AvatarFallback className="bg-primary/15 text-primary text-xs font-semibold">
+                    {initials}
+                  </AvatarFallback>
                 </Avatar>
                 <div className="hidden md:flex flex-col items-start leading-tight">
-                  <span className="text-xs font-medium">Operator</span>
-                  <span className="text-[10px] text-muted-foreground">admin@livekit.local</span>
+                  <span className="text-xs font-medium max-w-40 truncate">{identity.name}</span>
+                  <span className="text-[10px] text-muted-foreground max-w-40 truncate">{identity.email}</span>
                 </div>
               </Button>
             </DropdownMenuTrigger>
@@ -151,8 +181,16 @@ export function Topbar({ onCommandPalette }: { onCommandPalette?: () => void }) 
                 <Settings className="size-4 me-2" /> {t("nav.settings")}
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => router.push("/login")} className="text-destructive focus:text-destructive">
-                <LogOut className="size-4 me-2" /> {t("common.logout")}
+              <DropdownMenuItem
+                onSelect={(e) => {
+                  e.preventDefault()
+                  void handleLogout()
+                }}
+                disabled={loggingOut}
+                className="text-destructive focus:text-destructive"
+              >
+                <LogOut className="size-4 me-2" />
+                {loggingOut ? t("common.loggingOut") : t("common.logout")}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>

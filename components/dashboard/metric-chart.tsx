@@ -1,138 +1,83 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useMemo } from "react"
 import { Area, AreaChart, CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts"
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart"
 import { cn } from "@/lib/utils"
 
-function generateTimeSeries(points = 60, base = 50, jitter = 20) {
-  let v = base
-  return Array.from({ length: points }).map((_, i) => {
-    v = Math.max(0, Math.min(100, v + (Math.random() - 0.5) * jitter))
-    return {
-      t: i,
-      label: `${points - i}m`,
-      value: Math.round(v),
-    }
-  })
+/**
+ * Chart over measured samples.
+ *
+ * `data` is supplied by the caller — there is no internal timer and no
+ * generator. A chart that invents its own points is worse than no chart: it
+ * looks alive while telling you nothing. With real data the series moves when
+ * the system moves, and an empty array renders an explicit empty state rather
+ * than a flat line that reads as "steady at zero".
+ */
+
+export interface ChartSeries {
+  /** Data key, and the config key below. */
+  key: string
+  label: string
+  color?: string
+  /** Format for the tooltip and the Y axis tick. */
+  format?: (value: number) => string
+  /** Per-series Y axis domain. Omit to let recharts scale. */
+  domain?: [number | "auto", number | "auto"]
 }
 
-function generateMultiSeries(points = 60) {
-  let cpu = 42, ram = 58, net = 35, participants = 80
-  return Array.from({ length: points }).map((_, i) => {
-    cpu = Math.max(5, Math.min(95, cpu + (Math.random() - 0.5) * 12))
-    ram = Math.max(15, Math.min(92, ram + (Math.random() - 0.5) * 6))
-    net = Math.max(0, Math.min(100, net + (Math.random() - 0.5) * 18))
-    participants = Math.max(10, Math.min(320, participants + (Math.random() - 0.5) * 30))
-    return {
-      t: i,
-      label: `${points - i}m`,
-      cpu: Math.round(cpu),
-      ram: Math.round(ram),
-      net: Math.round(net),
-      participants: Math.round(participants),
-    }
-  })
+export interface ChartPoint {
+  /** ISO timestamp, used as the X axis key. */
+  at: string
+  [field: string]: string | number | null
 }
 
 export function MetricChart({
   title,
   description,
   type = "area",
-  series = "single",
+  series,
+  data,
   className,
   height = 220,
+  emptyLabel = "No samples yet",
 }: {
   title?: string
   description?: string
   type?: "area" | "line"
-  series?: "single" | "cpuRam" | "participants" | "traffic"
+  series: ChartSeries[]
+  data: ChartPoint[]
   className?: string
   height?: number
+  emptyLabel?: string
 }) {
-  const [data, setData] = useState(() =>
-    series === "single" ? generateTimeSeries(60, 50, 12) : generateMultiSeries(60),
-  )
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      setData((prev) => {
-        const next = prev.slice(1)
-        if (series === "single") {
-          const last = (prev[prev.length - 1] as { value: number }).value
-          const v = Math.max(0, Math.min(100, last + (Math.random() - 0.5) * 12))
-          return [...next, { t: prev.length, label: "now", value: Math.round(v) }] as typeof prev
-        }
-        const last = prev[prev.length - 1] as { cpu: number; ram: number; net: number; participants: number }
-        return [
-          ...next,
-          {
-            t: prev.length,
-            label: "now",
-            cpu: Math.max(5, Math.min(95, last.cpu + (Math.random() - 0.5) * 10)),
-            ram: Math.max(15, Math.min(92, last.ram + (Math.random() - 0.5) * 5)),
-            net: Math.max(0, Math.min(100, last.net + (Math.random() - 0.5) * 18)),
-            participants: Math.max(10, Math.min(320, last.participants + (Math.random() - 0.5) * 28)),
-          },
-        ] as typeof prev
-      })
-    }, 2000)
-    return () => clearInterval(id)
+  const config = useMemo<ChartConfig>(() => {
+    const out: ChartConfig = {}
+    series.forEach((s, i) => {
+      out[s.key] = {
+        label: s.label,
+        color: s.color ?? `var(--chart-${(i % 5) + 1})`,
+      }
+    })
+    return out
   }, [series])
 
-  const config: ChartConfig =
-    series === "cpuRam"
-      ? {
-          cpu: { label: "CPU %", color: "var(--chart-1)" },
-          ram: { label: "RAM %", color: "var(--chart-2)" },
-        }
-      : series === "participants"
-        ? { participants: { label: "Participants", color: "var(--chart-1)" } }
-        : series === "traffic"
-          ? { net: { label: "Network %", color: "var(--chart-2)" } }
-          : { value: { label: "Value", color: "var(--chart-1)" } }
+  const gradId = useMemo(
+    () => `grad-${series.map((s) => s.key).join("-") || "empty"}`,
+    [series],
+  )
 
-  const gradId = `grad-${series}`
+  const hasData = data.length > 0
 
-  const chart =
-    type === "area" ? (
-      <AreaChart data={data} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
-        <defs>
-          <linearGradient id={`${gradId}-1`} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="var(--chart-1)" stopOpacity={0.5} />
-            <stop offset="100%" stopColor="var(--chart-1)" stopOpacity={0} />
-          </linearGradient>
-          <linearGradient id={`${gradId}-2`} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="var(--chart-2)" stopOpacity={0.5} />
-            <stop offset="100%" stopColor="var(--chart-2)" stopOpacity={0} />
-          </linearGradient>
-        </defs>
-        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-        <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} interval={9} />
-        <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} width={32} />
-        <ChartTooltip content={<ChartTooltipContent />} />
-        {series === "cpuRam" ? (
-          <>
-            <Area type="monotone" dataKey="cpu" stroke="var(--chart-1)" strokeWidth={2} fill={`url(#${gradId}-1)`} />
-            <Area type="monotone" dataKey="ram" stroke="var(--chart-2)" strokeWidth={2} fill={`url(#${gradId}-2)`} />
-          </>
-        ) : series === "participants" ? (
-          <Area type="monotone" dataKey="participants" stroke="var(--chart-1)" strokeWidth={2} fill={`url(#${gradId}-1)`} />
-        ) : series === "traffic" ? (
-          <Area type="monotone" dataKey="net" stroke="var(--chart-2)" strokeWidth={2} fill={`url(#${gradId}-2)`} />
-        ) : (
-          <Area type="monotone" dataKey="value" stroke="var(--chart-1)" strokeWidth={2} fill={`url(#${gradId}-1)`} />
-        )}
-      </AreaChart>
-    ) : (
-      <LineChart data={data} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-        <XAxis dataKey="label" tickLine={false} axisLine={false} tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} interval={9} />
-        <YAxis tickLine={false} axisLine={false} tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} width={32} />
-        <ChartTooltip content={<ChartTooltipContent />} />
-        <Line type="monotone" dataKey="value" stroke="var(--chart-1)" strokeWidth={2} dot={false} />
-      </LineChart>
-    )
+  const formatTick = (v: number) => {
+    const spec = series[0]?.format
+    return spec ? spec(v) : String(v)
+  }
+
+  const labelFor = (point: ChartPoint) => {
+    const d = new Date(point.at)
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
+  }
 
   return (
     <div className={cn("rounded-2xl bg-card ring-1 ring-border p-5", className)}>
@@ -142,15 +87,135 @@ export function MetricChart({
             {title && <h3 className="text-sm font-semibold tracking-tight">{title}</h3>}
             {description && <p className="text-xs text-muted-foreground mt-0.5">{description}</p>}
           </div>
-          <span className="inline-flex items-center gap-1.5 text-[10px] font-medium text-success bg-success/10 ring-1 ring-success/20 px-2 py-0.5 rounded-full">
-            <span className="size-1.5 rounded-full bg-success animate-pulse-dot" />
-            LIVE
-          </span>
+          {hasData && (
+            <span className="inline-flex items-center gap-1.5 text-[10px] font-medium text-success bg-success/10 ring-1 ring-success/20 px-2 py-0.5 rounded-full">
+              <span className="size-1.5 rounded-full bg-success animate-pulse-dot" />
+              LIVE
+            </span>
+          )}
         </div>
       )}
-      <ChartContainer config={config} className="!aspect-auto w-full" style={{ height }}>
-        {chart}
-      </ChartContainer>
+
+      {!hasData ? (
+        <div
+          className="flex items-center justify-center text-xs text-muted-foreground"
+          style={{ height }}
+        >
+          {emptyLabel}
+        </div>
+      ) : (
+        <ChartContainer config={config} className="!aspect-auto w-full" style={{ height }}>
+          {type === "area" ? (
+            <AreaChart data={data} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+              <defs>
+                {series.map((s, i) => (
+                  <linearGradient key={s.key} id={`${gradId}-${s.key}`} x1="0" y1="0" x2="0" y2="1">
+                    <stop
+                      offset="0%"
+                      stopColor={s.color ?? `var(--chart-${(i % 5) + 1})`}
+                      stopOpacity={0.5}
+                    />
+                    <stop
+                      offset="100%"
+                      stopColor={s.color ?? `var(--chart-${(i % 5) + 1})`}
+                      stopOpacity={0}
+                    />
+                  </linearGradient>
+                ))}
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+              <XAxis
+                dataKey="at"
+                tickFormatter={labelFor}
+                tickLine={false}
+                axisLine={false}
+                tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                minTickGap={24}
+              />
+              <YAxis
+                tickFormatter={formatTick}
+                tickLine={false}
+                axisLine={false}
+                tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                width={48}
+                domain={series[0]?.domain}
+              />
+              <ChartTooltip
+                content={
+                  <ChartTooltipContent
+                    formatter={(value, name) => {
+                      const spec = series.find((s) => s.key === name)
+                      const n = typeof value === "number" ? value : Number(value)
+                      return [spec?.format && Number.isFinite(n) ? spec.format(n) : String(value), spec?.label ?? String(name)]
+                    }}
+                  />
+                }
+                labelFormatter={(label) => new Date(String(label)).toLocaleString()}
+              />
+              {/* connectNulls is deliberately off: a null point marks a sample the
+                  metrics endpoint never produced, and joining across it would
+                  draw a value that was never measured. */}
+              {series.map((s, i) => (
+                <Area
+                  key={s.key}
+                  type="monotone"
+                  dataKey={s.key}
+                  connectNulls={false}
+                  stroke={s.color ?? `var(--chart-${(i % 5) + 1})`}
+                  strokeWidth={2}
+                  fill={`url(#${gradId}-${s.key})`}
+                />
+              ))}
+            </AreaChart>
+          ) : (
+            <LineChart data={data} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+              <XAxis
+                dataKey="at"
+                tickFormatter={labelFor}
+                tickLine={false}
+                axisLine={false}
+                tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                minTickGap={24}
+              />
+              <YAxis
+                tickFormatter={formatTick}
+                tickLine={false}
+                axisLine={false}
+                tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                width={48}
+                domain={series[0]?.domain}
+              />
+              <ChartTooltip
+                content={
+                  <ChartTooltipContent
+                    formatter={(value, name) => {
+                      const spec = series.find((s) => s.key === name)
+                      const n = typeof value === "number" ? value : Number(value)
+                      return [
+                        spec?.format && Number.isFinite(n) ? spec.format(n) : String(value),
+                        spec?.label ?? String(name),
+                      ]
+                    }}
+                  />
+                }
+                labelFormatter={(label) => new Date(String(label)).toLocaleString()}
+              />
+              {series.map((s, i) => (
+                <Line
+                  key={s.key}
+                  type="monotone"
+                  dataKey={s.key}
+                  connectNulls={false}
+                  stroke={s.color ?? `var(--chart-${(i % 5) + 1})`}
+                  strokeWidth={2}
+                  dot={false}
+                />
+              ))}
+            </LineChart>
+          )}
+        </ChartContainer>
+      )}
     </div>
   )
 }

@@ -1,61 +1,107 @@
-import { NextResponse } from "next/server"
-import { isLiveKitConfigured, getRoomService, getEgressClient } from "@/lib/livekit-server"
+import { NextRequest, NextResponse } from 'next/server'
+import { EgressStatus } from 'livekit-server-sdk'
+import { authenticate } from '@/lib/auth/session'
+import { getLiveKitAdapter } from '@/lib/livekit/adapter'
+import { collectMetrics } from '@/lib/metrics/collect'
+import { listSnapshots, recordSnapshot } from '@/lib/metrics/store'
 
-export const dynamic = "force-dynamic"
-export const runtime = "nodejs"
+export const dynamic = 'force-dynamic'
+export const runtime = 'nodejs'
 
-export async function GET() {
-  if (!isLiveKitConfigured()) {
-    return NextResponse.json({ error: "LiveKit is not configured." }, { status: 400 })
-  }
+/**
+ * Protocol enum number → the name an operator recognises.
+ *
+ * Derived from the SDK enum rather than written out by hand: a literal table
+ * silently mislabels every status if the protocol ever renumbers, and the UI
+ * would report "complete" for a failed recording.
+ */
+const EGRESS_STATUS_NAMES: Record<number, string> = Object.fromEntries(
+  Object.entries(EgressStatus)
+    .filter(([, v]) => typeof v === 'number')
+    .map(([k, v]) => [v as number, k.replace(/^EGRESS_/, '').toLowerCase()]),
+)
+
+
+/**
+ * Monitoring aggregates, built from measured values only.
+ *
+ * Room and participant counts come from the RoomService, which is the
+ * authoritative source for "what exists right now". Everything under
+ * `system` comes from the Prometheus endpoint and is null when that endpoint
+ * is absent — the previous version of this route invented CPU/RAM/network
+ * figures with Math.random(), and the UI then derived jitter, RTT and packet
+ * loss from those invented numbers.
+ *
+ * `system.host` stays null even when the metrics endpoint is up: those series
+ * describe the livekit-server process, not the machine under it. Reporting
+ * host CPU would mean reaching outside this service.
+ */
+export async function GET(req: NextRequest) {
+  const identity = await authenticate(req.headers)
+  if (!identity) return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
 
   try {
-    const svc = getRoomService()
-    const egressClient = getEgressClient()
+    const adapter = getLiveKitAdapter()
+    const [rooms, egress, metrics] = await Promise.all([
+      adapter.listRooms(),
+      // Active only: listEgress() also returns completed jobs, and counting
+      // those as "recordings running" inflated the number after every session.
+      adapter.listActiveEgress().catch(() => []),
+      collectMetrics(),
+    ])
 
-    // Fetch all rooms
-    const rooms = await svc.listRooms()
+    // History write is best-effort and rate-limited inside recordSnapshot, so
+    // several viewers cannot turn this into a write storm.
+    await recordSnapshot(metrics)
+    const history = await listSnapshots(240).catch(() => [])
 
-    // Calculate aggregate metrics
     let totalParticipants = 0
     let totalPublishers = 0
     let totalMaxParticipants = 0
-    let activeRecordings = 0
+    const roomsFlaggedRecording = new Set<string>()
 
     const roomDetails = rooms.map((r) => {
       const participants = r.numParticipants ?? 0
-      const publishers = r.numPublishers ?? 0
-      const maxParticipants = r.maxParticipants ?? 0
-      const recording = r.activeRecording ?? false
-
       totalParticipants += participants
-      totalPublishers += publishers
-      totalMaxParticipants += maxParticipants
-      if (recording) activeRecordings++
+      totalPublishers += r.numPublishers ?? 0
+      totalMaxParticipants += r.maxParticipants ?? 0
+      if (r.activeRecording) roomsFlaggedRecording.add(r.name)
 
       return {
         name: r.name,
         sid: r.sid,
         participants,
-        publishers,
-        maxParticipants,
-        recording,
-        createdAt: r.creationTime ? new Date(Number(r.creationTime) * 1000).toISOString() : null,
-        metadata: r.metadata ?? "",
+        publishers: r.numPublishers ?? 0,
+        maxParticipants: r.maxParticipants ?? 0,
+        recording: Boolean(r.activeRecording),
+        createdAt: r.creationTimeMs ? new Date(Number(r.creationTimeMs)).toISOString() : null,
+        metadata: r.metadata ?? '',
       }
     })
 
-    // Fetch active egress
-    let egressInfo: any[] = []
-    try {
-      egressInfo = await egressClient.listEgress({ active: true })
-    } catch {
-      // Egress might not be configured
-    }
+    // A room carrying activeRecording is normally the same job the egress list
+    // already reports. Counting both sources double-counted one recording, so
+    // the number is the union: active egress jobs, plus flagged rooms that have
+    // no matching egress entry yet.
+    const egressSummaries = egress.map((e: any) => ({
+      id: e.egressId ?? e.id ?? null,
+      roomName: e.roomName ?? null,
+      status: EGRESS_STATUS_NAMES[e.status as number] ?? null,
+      startedAt: e.startedAt ? new Date(Number(e.startedAt) / 1_000_000).toISOString() : null,
+    }))
+    const matchedRooms = new Set(
+      egressSummaries.map((e) => e.roomName).filter((n): n is string => Boolean(n)),
+    )
+    const recordingsActive = new Set<string>(matchedRooms)
+    for (const name of roomsFlaggedRecording) recordingsActive.add(name)
 
-    // Calculate derived metrics
     const avgParticipantsPerRoom = rooms.length > 0 ? totalParticipants / rooms.length : 0
-    const capacityUtilization = totalMaxParticipants > 0 ? (totalParticipants / totalMaxParticipants) * 100 : 0
+    const capacityUtilization =
+      totalMaxParticipants > 0 ? (totalParticipants / totalMaxParticipants) * 100 : null
+
+    // CPU is derived in the store, from the delta between stored counters, so the
+    // value survives a dashboard restart. Null on the first sample of a window.
+    const cpuPercent = history.at(-1)?.cpuPercent ?? null
 
     return NextResponse.json({
       rooms: {
@@ -69,28 +115,54 @@ export async function GET() {
       },
       capacity: {
         max: totalMaxParticipants,
-        utilization: Math.round(capacityUtilization * 10) / 10,
+        utilization:
+          capacityUtilization === null ? null : Math.round(capacityUtilization * 10) / 10,
       },
       recordings: {
-        active: activeRecordings + egressInfo.length,
-        egress: egressInfo.map((e: any) => ({
-          id: e.id,
-          roomName: e.roomName,
-          status: e.status,
-          startedAt: e.startedAt ? new Date(Number(e.startedAt) / 1000000).toISOString() : null,
-        })),
+        active: recordingsActive.size,
+        egress: egressSummaries,
       },
       roomDetails,
-      // Simulated system metrics (in production, these would come from infrastructure monitoring)
       system: {
-        cpu: Math.min(95, Math.max(10, totalParticipants * 2 + Math.random() * 10)),
-        ram: Math.min(90, Math.max(20, totalParticipants * 3 + Math.random() * 15)),
-        network: Math.min(80, Math.max(5, totalParticipants * 1.5 + Math.random() * 10)),
+        available: metrics.available,
+        error: metrics.error ?? null,
+        cpuPercent,
+        ramBytes: metrics.process.residentMemoryBytes,
+        heapBytes: metrics.process.heapInuseBytes,
+        goroutines: metrics.process.goroutines,
+        openFds: metrics.process.openFds,
+        uptimeSeconds: metrics.process.uptimeSeconds,
+        networkRxBytes: metrics.process.networkReceiveBytesTotal,
+        networkTxBytes: metrics.process.networkTransmitBytesTotal,
+        // Not measurable from inside this service.
+        host: null,
       },
+      webrtc: {
+        jitterSeconds: metrics.webrtc.jitterSeconds,
+        latencyMsAvg: metrics.webrtc.latencyMsAvg,
+        latencyMsP95: metrics.webrtc.latencyMsP95,
+        packetLossRatio: metrics.transports.packetLossRatio,
+        packetsOut: metrics.transports.packetsOut,
+        packetsDropped: metrics.transports.packetsDropped,
+      },
+      // Server-side aggregate. `participants` here is the Prometheus gauge,
+      // which counts node-local connections; the RoomService figures above are
+      // the cluster-wide ones.
+      metrics: {
+        rooms: metrics.rooms,
+        participants: metrics.participants,
+        transports: metrics.transports,
+        quality: metrics.quality,
+        webrtc: metrics.webrtc,
+        api: metrics.api,
+      },
+      webhooks: metrics.webhooks,
+      history,
+      collectedAt: new Date(metrics.at).toISOString(),
     })
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Unknown error" },
+      { error: err instanceof Error ? err.message : 'Unknown error' },
       { status: 500 },
     )
   }

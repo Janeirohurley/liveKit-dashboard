@@ -1,10 +1,12 @@
 "use client"
 
 import Link from "next/link"
+import { useMemo } from "react"
 import { usePathname } from "next/navigation"
 import { LayoutDashboard, Radio, Users, KeyRound, Activity, ScrollText, Settings, ServerCog } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useI18n } from "@/lib/i18n"
+import { useConfig } from "@/hooks/useConfig"
 
 const items = [
   { href: "/dashboard", icon: LayoutDashboard, key: "nav.dashboard" },
@@ -19,6 +21,28 @@ const items = [
 export function SidebarNav({ className }: { className?: string }) {
   const pathname = usePathname()
   const { t } = useI18n()
+  const { config, loading, error } = useConfig()
+
+  const status = useMemo(() => {
+    if (loading) return { connected: false, pending: true, label: t("common.loading"), detail: "..." }
+    if (error) return { connected: false, pending: false, label: t("sidebar.statusUnreachable"), detail: "API error" }
+    if (!config) return { connected: false, pending: false, label: t("sidebar.statusUnknown"), detail: "n/a" }
+    if (!config.configured || config.connectionStatus === "not_configured") {
+      return { connected: false, pending: false, label: t("sidebar.statusNotConfigured"), detail: "LIVEKIT_URL" }
+    }
+    if (config.connectionStatus === "error") {
+      return { connected: false, pending: false, label: t("sidebar.statusUnreachable"), detail: config.url ?? "n/a" }
+    }
+    return {
+      connected: config.connectionStatus === "connected",
+      pending: false,
+      label:
+        config.connectionStatus === "connected"
+          ? t("sidebar.statusConnected")
+          : t("sidebar.statusUnknown"),
+      detail: `${config.roomCount} ${t("sidebar.rooms")} \u00b7 ${config.region}`,
+    }
+  }, [config, loading, error, t])
 
   return (
     <aside
@@ -61,14 +85,25 @@ export function SidebarNav({ className }: { className?: string }) {
 
       <div className="p-3 border-t border-border">
         <div className="rounded-xl bg-card/60 ring-1 ring-border p-3">
+          {/* Reachability comes from /api/config, which actually calls RoomService.
+              A hardcoded "Cluster healthy" stayed green while the cluster was down. */}
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <span className="relative flex size-2">
-              <span className="absolute inline-flex h-full w-full rounded-full bg-success opacity-60 animate-ping" />
-              <span className="relative inline-flex size-2 rounded-full bg-success" />
+              {status.connected && (
+                <span className="absolute inline-flex h-full w-full rounded-full bg-success opacity-60 animate-ping" />
+              )}
+              <span
+                className={cn(
+                  "relative inline-flex size-2 rounded-full",
+                  status.connected ? "bg-success" : status.pending ? "bg-muted-foreground/40" : "bg-destructive",
+                )}
+              />
             </span>
-            <span>Cluster healthy</span>
+            <span className="truncate">{status.label}</span>
           </div>
-          <div className="mt-2 text-[11px] font-mono text-muted-foreground">v1.7.2 • 3 nodes</div>
+          <div className="mt-2 text-[11px] font-mono text-muted-foreground truncate" title={status.detail}>
+            {status.detail}
+          </div>
         </div>
       </div>
     </aside>

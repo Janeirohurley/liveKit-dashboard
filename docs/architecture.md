@@ -2,391 +2,260 @@
 
 ## System Design
 
-The LiveKit Dashboard is a **single-page Next.js application** that acts as an admin console for a self-hosted LiveKit server. It follows a client-server architecture within a single Next.js codebase:
+The LiveKit Dashboard is a Next.js admin console for a self-hosted LiveKit server.
+Server components handle session checks, API routes talk to LiveKit and PostgreSQL
+on the server, and the browser polls the dashboard's own API for data.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                          Browser                                 │
 │                                                                   │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                    React Components                        │  │
-│  │                                                             │  │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐   │  │
-│  │  │  AppShell   │  │  Page Views │  │  UI Components  │   │  │
-│  │  │ (layout)    │  │ (dashboard, │  │  (shadcn/ui)    │   │  │
-│  │  │             │  │  rooms, etc)│  │                 │   │  │
-│  │  └──────┬──────┘  └──────┬──────┘  └────────┬────────┘   │  │
-│  │         │                │                   │            │  │
-│  │  ┌──────┴────────────────┴───────────────────┴────────┐   │  │
-│  │  │              Custom React Hooks                     │   │  │
-│  │  │   useRooms() · useParticipants() · useEgress()      │   │  │
-│  │  │   useConfig() · use-toast() · use-mobile()          │   │  │
-│  │  └──────────────────────┬─────────────────────────────┘   │  │
-│  └─────────────────────────┼─────────────────────────────────┘  │
-│                            │ fetch() to /api/*                  │
-└────────────────────────────┼─────────────────────────────────────┘
-                             │
+│  React components under app/(app)/, which is session-gated       │
+│  server-side: unauthenticated visitors get a 307 to /login.      │
+│                                                                   │
+│  Custom hooks own all fetching:                                  │
+│    useRooms()          rooms list, 4s poll                       │
+│    useRoom()           one room                                  │
+│    useParticipants()   participants + tracks, 3s poll            │
+│    useMonitoring()     aggregates + metrics history, 5s poll     │
+│    useEventStream()    SSE with a 10s polling fallback           │
+│    useRoomEvents()     persisted events for one room             │
+│    useConfig()         cluster reachability                     │
+│                                                                   │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ fetch(), cookies attached
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Next.js Server (Node.js)                      │
 │                                                                   │
+│  app/(app)/layout.tsx  authenticate() → redirect /login          │
+│                                                                   │
+│  API routes — every one authenticated except the four below      │
+│    /api/auth/login    /api/auth/logout                           │
+│    /api/health        (public liveness)                          │
+│    /api/webhooks/*    (LiveKit's own JWT signature)              │
+│                                                                   │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │                   API Routes (/api/*)                      │  │
-│  │                                                             │  │
-│  │  /api/config     — Connection status                       │  │
-│  │  /api/rooms      — List/create rooms                       │  │
-│  │  /api/rooms/:id  — Participants, delete room/participant   │  │
-│  │  /api/tokens     — Generate JWT access tokens              │  │
-│  │  /api/egress     — List/start/stop recordings              │  │
-│  │  /api/events     — Webhook event history                   │  │
-│  │  /api/monitoring — System metrics                          │  │
-│  │  /api/webhooks/* — Receive LiveKit webhooks                │  │
-│  │                                                             │  │
+│  │  lib/auth/ — sessions, scrypt, audit log                   │  │
+│  │    dashboard_admins · dashboard_sessions                   │  │
+│  │    dashboard_audit_log (redacted metadata)                 │  │
 │  └──────────────────────┬────────────────────────────────────┘  │
 │                         │                                        │
 │  ┌──────────────────────┴────────────────────────────────────┐  │
-│  │              lib/livekit-server.ts                         │  │
-│  │                                                             │  │
-│  │  • RoomServiceClient (singleton)                           │  │
-│  │  • EgressClient (singleton)                                │  │
-│  │  • WebhookReceiver (singleton)                             │  │
-│  │  • createAccessToken()                                     │  │
-│  │  • getLiveKitConfig() / isLiveKitConfigured()              │  │
-│  │                                                             │  │
+│  │  lib/livekit/adapter.ts — one typed DTO layer              │  │
+│  │    maps protocol enums to strings, so an upstream           │  │
+│  │    reordering cannot silently reinterpret the UI            │  │
+│  │    returns null for fields this protocol version lacks      │  │
 │  └──────────────────────┬────────────────────────────────────┘  │
 │                         │                                        │
 │  ┌──────────────────────┴────────────────────────────────────┐  │
-│  │              lib/webhook-store.ts                          │  │
-│  │                                                             │  │
-│  │  • In-memory event store (max 500 events)                  │  │
-│  │  • recordWebhookEvent() / listWebhookEvents()              │  │
-│  │                                                             │  │
+│  │  lib/metrics/ — measured values only                       │  │
+│  │    prometheus.ts  text-format parser + aggregates          │  │
+│  │    collect.ts     raw samples → MetricsSnapshot            │  │
+│  │    store.ts       snapshot history, retention on write     │  │
+│  └──────────────────────┬────────────────────────────────────┘  │
+│                         │                                        │
+│  ┌──────────────────────┴────────────────────────────────────┐  │
+│  │  lib/webhook-store.ts + lib/events/bus.ts                  │  │
+│  │    PostgreSQL is the source of truth; the bus fans out     │  │
+│  │    in-process to SSE subscribers                            │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                   │
-└─────────────────────────┬─────────────────────────────────────────┘
-                          │ LiveKit Server SDK (HTTP/gRPC)
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    LiveKit Server (:7880)                        │
-│                                                                   │
-│  • Room management                                               │
-│  • Participant management                                        │
-│  • WebRTC SFU (Selective Forwarding Unit)                        │
-│  • Egress (recording/streaming)                                  │
-│  • Webhook event dispatch                                        │
-│                                                                   │
-└─────────────────────────┬─────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Redis (:6379)                               │
-│                                                                   │
-│  • Message bus for LiveKit cluster                               │
-│  • State synchronization across nodes                            │
-│                                                                   │
-└─────────────────────────────────────────────────────────────────┘
+└──────────┬──────────────────────────────────┬───────────────────┘
+           │                                  │
+           │ Twirp (LiveKit SDK)              │ postgres
+           ▼                                  ▼
+┌────────────────────────────┐   ┌──────────────────────────────────┐
+│  LiveKit Server (:7880)    │   │  PostgreSQL                      │
+│  rooms · participants       │   │  admins · sessions · audit       │
+│  egress · ingress · SIP     │   │  webhook events · metric history │
+│  agents · webhooks          │   └──────────────────────────────────┘
+└──────────┬─────────────────┘
+           │
+           ├──────────────► Prometheus endpoint (:9090/metrics)
+           │                 Go client + process_* series
+           ▼
+      Redis (cluster bus)
 ```
+
+## The no-fabrication rule
+
+A dashboard is trusted to report the state of a system people make decisions
+from. A plausible-looking number is worse than a missing one, because it cannot be
+distinguished from a real reading. So the rule throughout: **a metric the server
+does not report is `null`, and the UI renders "n/a" or an explicit empty state.**
+
+Consequences worth knowing about, because they look like missing features:
+
+- **Per-room metrics do not exist.** LiveKit labels media series with `node_id`,
+  never with a room name. Per-room CPU, bitrate, or packet loss cannot be read
+  from the metrics endpoint, so the room page does not chart them.
+- **Host CPU and memory do not exist.** `process_*` describes the livekit-server
+  process. The monitoring page reports the process and sets `system.host` to null.
+- **Latency quantiles do not exist.** `livekit_forward_latency_ns` ships
+  `_sum`/`_count` but no buckets, so only a mean is derivable.
+- **Cumulative participants do not exist.** `livekit_participant_total` is a gauge
+  of current connections.
+- **CPU percent needs two samples.** `process_cpu_seconds_total` is a counter; the
+  first point of any window has no baseline and reads null.
+- **Per-participant RTT, loss, bitrate, device, and browser do not exist.** The
+  RoomService does not report them. These fields were present in the mock data
+  that the UI originally rendered.
 
 ## Directory Structure
 
-### `app/` — Next.js App Router
-
-The `app/` directory contains all pages and API routes using Next.js 16's App Router.
-
-| Path | Purpose |
-|------|---------|
-| `app/layout.tsx` | Root layout with ThemeProvider, I18nProvider, Toaster, and Analytics |
-| `app/page.tsx` | Root page (redirects to login or dashboard) |
-| `app/login/page.tsx` | Demo login page (no real authentication) |
-| `app/(app)/layout.tsx` | App shell layout (sidebar + topbar wrapper) |
-| `app/(app)/dashboard/` | Main overview dashboard |
-| `app/(app)/rooms/` | Room listing and detail pages |
-| `app/(app)/users/` | Participants view |
-| `app/(app)/tokens/` | Token generator page |
-| `app/(app)/monitoring/` | System monitoring page |
-| `app/(app)/logs/` | Server logs page |
-| `app/(app)/settings/` | Settings page |
-| `app/api/` | All server-side API routes (Node.js runtime) |
-
-**Why the `(app)` route group?** Pages inside `(app)/` share a common layout with sidebar navigation and topbar. The parentheses make `(app)` a route group — it doesn't appear in the URL path.
-
-### `components/` — React Components
-
-| Directory | Purpose |
-|-----------|---------|
-| `components/ui/` | shadcn/ui primitive components (Button, Input, Dialog, etc.) |
-| `components/shell/` | App layout: AppShell, SidebarNav, Topbar, CommandPalette |
-| `components/dashboard/` | Dashboard-specific: DashboardView, StatsCard, MetricChart, StatusBadge |
-| `components/rooms/` | Room-specific: RoomsView, RoomDetailView |
-| `components/users/` | Participants view component |
-| `components/tokens/` | Token generator view |
-| `components/monitoring/` | Monitoring metrics view |
-| `components/logs/` | Log viewer component |
-| `components/settings/` | Settings form component |
-| `components/error-boundary.tsx` | React error boundary wrapper |
-
-### `hooks/` — Custom React Hooks
-
-| Hook | Purpose | Polling Interval |
-|------|---------|------------------|
-| `useRooms()` | Fetches room list from `/api/rooms` | 4 seconds |
-| `useParticipants(roomName)` | Fetches participants from `/api/rooms/:name` | 3 seconds |
-| `useEgress()` | Fetches egress sessions from `/api/egress` | 5 seconds |
-| `useConfig()` | Fetches connection config from `/api/config` | On mount |
-| `use-toast()` | Toast notification management | N/A |
-| `use-mobile()` | Detects mobile viewport | On resize |
-
-### `lib/` — Shared Utilities
-
-| File | Purpose |
-|------|---------|
-| `lib/livekit-server.ts` | LiveKit Server SDK initialization and client management |
-| `lib/mock-data.ts` | TypeScript type definitions (Room, Participant, LogEntry, etc.) |
-| `lib/webhook-store.ts` | In-memory webhook event storage |
-| `lib/i18n.tsx` | Internationalization provider (en/fa with RTL) |
-| `lib/utils.ts` | Utility functions: `cn()`, `formatDuration()`, `formatBytes()` |
-
-### `livekit-server/` — Docker Compose
-
-Contains `docker-compose.yaml` for running a local LiveKit server with Redis and SIP gateway.
+```
+app/
+  (app)/            session-gated pages (dashboard, rooms, monitoring, logs, …)
+  api/              route handlers; see docs/api-reference.md
+  login/            unauthenticated
+  page.tsx          redirects to /dashboard
+components/
+  dashboard/        stats-card, metric-chart, status-badge
+  monitoring/       monitoring-view
+  rooms/            room-detail-view
+  logs/             logs-view
+hooks/              one hook per polled resource
+lib/
+  auth/             session, password, token signing, audit
+  db/               postgres client, idempotent migrations
+  events/           in-process bus, shared event types
+  livekit/          adapter and its tests
+  metrics/          prometheus parser, collector, store, formatters
+  webhook-store.ts  PostgreSQL event store
+livekit-server/     docker compose: livekit, redis, prometheus port
+```
 
 ## Data Flow
 
-### 1. Room Listing Flow
+### 1. Session and page load
+
+`app/(app)/layout.tsx` calls `authenticate(headers())`, which verifies the HMAC
+cookie and then re-checks the session row. Any of no cookie, bad signature,
+unknown session, revoked, expired, disabled account, or a `token_version` mismatch
+(password changed since issue) resolves to null, and the layout redirects.
+
+The check is in the layout rather than middleware because middleware runs on the
+Edge runtime and cannot reach Postgres, where sessions live. API routes check
+independently, so the layout is about not serving the shell to an anonymous
+visitor, not about access control.
+
+The resolved identity is passed into `AppShell`, so the topbar shows the operator
+who is actually signed in. Hardcoding a name there would mean every audit entry on
+a shared deployment points at the same fictitious person.
+
+Session length is chosen at sign-in and stored on the session row: 30 minutes of
+inactivity normally, 8 hours when "remember me" is ticked. Expiry is renewed on
+every authenticated request against that stored value, so it behaves as an idle
+timeout rather than a total session length — and an unremembered session stays at
+30 minutes for its whole life instead of being silently extended back to 8 hours by
+the renewal.
+
+### 2. Room listing
+
+`useRooms()` → `GET /api/rooms` → `authenticate()` → `adapter.listRooms()` →
+audit → JSON. The client polls every 4 seconds and aborts any request still in
+flight before starting the next, so a slow response cannot overwrite a newer one.
+
+### 3. Webhook reception
 
 ```
-User opens /rooms
-       │
-       ▼
-RoomsView component mounts
-       │
-       ▼
-useRooms() hook executes
-       │
-       ▼
-fetch('/api/rooms')
-       │
-       ▼
-API route: GET /api/rooms
-       │
-       ├── isLiveKitConfigured() check
-       │
-       └── getRoomService().listRooms()
-              │
-              ▼
-         LiveKit Server SDK
-              │
-              ▼
-         LiveKit Server (:7880)
-              │
-              ▼
-         Returns room list
-              │
-              ▼
-         Maps SDK response to Room[] type
-              │
-              ▼
-         NextResponse.json({ rooms })
-              │
-              ▼
-useRooms() receives response
-       │
-       ▼
-setRooms(data.rooms)
-       │
-       ▼
-RoomsView re-renders with room data
+LiveKit ──signed POST──► /api/webhooks/livekit
+                              │
+                              ├─ verify Authorization with WebhookReceiver  (401 on failure)
+                              ├─ write to dashboard_webhook_events          (idempotent on event id)
+                              └─ publish on lib/events/bus
+                                        │
+                                        ▼
+                              /api/stream (SSE, ?room= scoping)
+                                        │
+                                        ▼
+                              useEventStream() → logs view
 ```
 
-### 2. Token Generation Flow
+A store failure does **not** fail the request: LiveKit would retry, and a retry
+storm against a slow database is worse than one event that shows up on the next
+poll.
+
+The bus is in-process. With two dashboard instances each sees only its own
+webhooks — nothing is lost, because PostgreSQL is the source of truth and the
+client polls every 10 seconds, but sub-second delivery on a multi-instance
+deployment needs shared pub/sub.
+
+### 4. Metrics collection
 
 ```
-User fills token form on /tokens
-       │
-       ▼
-TokensView submits form
-       │
-       ▼
-fetch('/api/tokens', { method: 'POST', body: grants })
-       │
-       ▼
-API route: POST /api/tokens
-       │
-       ├── isLiveKitConfigured() check
-       │
-       └── createAccessToken(grants)
-              │
-              ├── new AccessToken(apiKey, apiSecret, { identity, ttl })
-              │
-              ├── at.addGrant({ roomJoin: true, room, canPublish, canSubscribe, ... })
-              │
-              └── at.toJwt()
-                     │
-                     ▼
-                Returns JWT string
-                     │
-                     ▼
-NextResponse.json({ token, url, identity, expiresIn })
-                     │
-                     ▼
-TokensView displays token to user
+/api/monitoring
+   │
+   ├─ collectMetrics()  ──► GET LIVEKIT_METRICS_URL  (2s cache, shared by all tabs)
+   │                          └─ parsePrometheus → toSnapshot
+   ├─ recordSnapshot()  ──► dashboard_metrics_snapshots  (1 write / 30s, 24h retention)
+   └─ listSnapshots()   ──► history for the charts
 ```
 
-### 3. Webhook Reception Flow
+CPU percentages are derived in the store, from the delta between two stored
+counters, rather than from an in-memory previous value — so the number survives a
+dashboard restart instead of going null until the second sample after every
+redeploy.
 
-```
-LiveKit Server detects event (room created, participant joined, etc.)
-       │
-       ▼
-POST to configured webhook URL: /api/webhooks/livekit
-       │
-       ├── Headers: Content-Type: application/webhook+json
-       │           Authorization: <signed JWT>
-       │
-       ▼
-API route: POST /api/webhooks/livekit
-       │
-       ├── getWebhookReceiver().receive(body, auth)
-       │      │
-       │      └── Validates JWT signature against API key/secret
-       │
-       ├── recordWebhookEvent({ id, event, room, participant, raw })
-       │      │
-       │      └── Stores in-memory (max 500 events)
-       │
-       └── NextResponse.json({ ok: true })
-              │
-              ▼
-User views events on /logs via GET /api/events
-```
+An unavailable sample is still written, with every metric `null`. Dropping the row
+would make an outage look like a gap in the series, and carrying the last value
+forward would draw a flat line through it. Charts bridge with
+`connectNulls={false}`, so the outage is visible. A metric that recovers gets no
+value on its first sample either, since there is no baseline for the delta.
+
+### 5. Recording counts
+
+`recordings.active` is the number of distinct rooms being recorded, not the number
+of signals that a recording is happening. It is the union of the active egress
+jobs (`starting`, `active`, `ending`) and the rooms RoomService flags with
+`activeRecording`, deduplicated by room name. Those two sources describe the same
+job, so summing them counted a single recording twice. Egress statuses are mapped
+through the SDK enum rather than a hand-written table, because a literal list
+silently mislabels every status if the protocol ever renumbers.
 
 ## Key Design Decisions
 
-### Singleton Pattern for SDK Clients
+### One adapter instead of raw SDK calls
 
-**Decision:** SDK clients (RoomServiceClient, EgressClient, WebhookReceiver) are created as lazy singletons.
+Route handlers call `lib/livekit/adapter.ts`, which returns DTOs with string
+enums and explicit nulls. Raw `ParticipantInfo` leaks numeric protocol enums into
+the UI, where a reordering upstream would silently relabel a track type, and it
+invites the `p.type === 0` comparisons that make a future migration dangerous.
 
-```typescript
-let roomServiceInstance: RoomServiceClient | null = null
+The same rule is why `joinedAt` is read as milliseconds. The original code did
+`new Date(Number(p.joinedAt) * 1000)`, making every join time wrong by three
+orders of magnitude.
 
-export function getRoomService(): RoomServiceClient {
-  if (roomServiceInstance) return roomServiceInstance
-  // ... create and cache
-}
-```
+### Validate request bodies at the edge of the app
 
-**Why:** 
-- SDK clients are expensive to create (establish connections, parse config)
-- Serverless environments may reuse containers across requests
-- Singletons ensure one client per process lifetime
+`app/api/tokens/route.ts` checks the request shape before any business logic runs.
+A non-string `identity` used to be signed straight into a JWT, `"abc"` as
+`ttlSeconds` became `NaN` in the expiry, and a non-array `canPublishSources`
+threw out of the mapping — all reported as `500`, which tells the operator the
+dashboard is broken when the mistake was in the request. Malformed input is the
+caller's problem, so it is a `400` with a specific message.
 
-**Trade-off:** In a multi-tenant scenario, you'd need per-tenant clients instead.
+The same reasoning is why `POST /api/rooms` rejects a duplicate name with `409`
+rather than letting the SDK error pass through, and why `DELETE /api/rooms/:name`
+returns `404` when the room is already gone: the caller's intent is satisfied
+either way, and that has to be distinguishable from the cluster being unreachable.
 
-### AbortController for Polling
+### Retention enforced on write
 
-**Decision:** Each polling hook uses `AbortController` to cancel stale requests.
+There is no scheduler in this app, so pruning runs on the insert path. The write
+is already rate-limited to one row per 30 seconds, so the delete cannot spin.
 
-```typescript
-const abortRef = useRef<AbortController | null>(null)
+### Charts render what they are given
 
-const fetchRooms = useCallback(async () => {
-  abortRef.current?.abort()        // Cancel previous request
-  abortRef.current = new AbortController()
-  const signal = abortRef.current.signal
-  const res = await fetch('/api/rooms', { signal })
-  // ...
-}, [])
-```
+`MetricChart` takes `data` and `series` props and has no timer. It renders an
+explicit empty state when `data` is empty. The previous version generated its own
+points with `Math.random()` every two seconds, which meant the monitoring page
+showed invented jitter, RTT, and packet loss derived from an invented network
+percentage.
 
-**Why:**
-- Prevents race conditions when polling intervals overlap
-- Avoids memory leaks from abandoned fetch promises
-- Ensures UI always shows the most recent data
+### Force-dynamic API routes
 
-### Force-Dynamic API Routes
-
-**Decision:** All API routes set `dynamic = "force-dynamic"` and `runtime = "nodejs"`.
-
-```typescript
-export const dynamic = "force-dynamic"
-export const runtime = "nodejs"
-```
-
-**Why:**
-- `force-dynamic` prevents Next.js from statically optimizing these routes (they must run on each request)
-- `nodejs` ensures the route runs on Node.js (not Edge runtime), required for the LiveKit SDK
-- These routes make external HTTP calls and must never be cached
-
-### BigInt to Number Conversion
-
-**Decision:** API routes convert `bigint` timestamps from the SDK to JavaScript `number`.
-
-```typescript
-function bigintToNumber(v: bigint | number | undefined): number {
-  if (typeof v === "bigint") return Number(v)
-  return v ?? 0
-}
-```
-
-**Why:** The LiveKit Server SDK returns timestamps as `bigint` (to handle nanosecond precision), but `JSON.stringify` cannot serialize `bigint`. Converting to `number` is safe for second/millisecond precision.
-
-## Module Dependencies
-
-```
-app/(app)/* pages
-    │
-    ├── components/shell/* (layout)
-    ├── components/*/views (feature components)
-    │       │
-    │       ├── components/ui/* (primitives)
-    │       └── hooks/* (data fetching)
-    │               │
-    │               └── app/api/* (HTTP endpoints)
-    │                       │
-    │                       └── lib/livekit-server.ts (SDK clients)
-    │                               │
-    │                               └── livekit-server-sdk (npm package)
-    │
-    └── lib/i18n.tsx (translations)
-
-app/api/* routes
-    │
-    ├── lib/livekit-server.ts
-    ├── lib/webhook-store.ts
-    └── lib/mock-data.ts (types)
-```
-
-## Extension Points
-
-### Adding Real Authentication
-
-Replace the demo login by:
-1. Adding `app/middleware.ts` with session validation
-2. Integrating an auth provider (NextAuth, Clerk, Supabase Auth)
-3. Protecting the `(app)` route group in middleware
-4. Updating `/login` to use the real auth flow
-
-### Adding Persistent Webhook Storage
-
-Replace `lib/webhook-store.ts` with:
-- **PostgreSQL:** Use Prisma or Drizzle ORM
-- **Redis:** Use Upstash or self-hosted Redis
-- **File-based:** Append to JSON lines file (for small deployments)
-
-Keep the same function signatures (`recordWebhookEvent`, `listWebhookEvents`, `clearWebhookEvents`) for a drop-in replacement.
-
-### Adding Real-Time Updates via WebSockets
-
-Replace polling hooks with:
-1. A WebSocket connection to the LiveKit server
-2. Server-sent events (SSE) from a new `/api/stream` endpoint
-3. LiveKit's own real-time events API
-
-The hook interfaces (`UseRoomsReturn`, `UseParticipantsReturn`) can remain the same — only the internal implementation changes.
-
-### Adding Multi-Region Support
-
-The `LIVEKIT_REGION` env var is already passed through to room data. To support multiple regions:
-1. Store multiple LiveKit configurations
-2. Route API calls based on region parameter
-3. Update the UI to filter/group by region
+Every route sets `dynamic: "force-dynamic"` and `runtime: "nodejs"`. These
+handlers depend on request cookies and on Postgres, neither of which can be read
+at build time.

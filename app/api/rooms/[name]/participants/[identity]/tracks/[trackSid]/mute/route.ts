@@ -1,28 +1,40 @@
-import { NextResponse } from "next/server"
-import { isLiveKitConfigured, getRoomService } from "@/lib/livekit-server"
+import { NextRequest, NextResponse } from 'next/server'
+import { authenticate } from '@/lib/auth/session'
+import { getLiveKitAdapter } from '@/lib/livekit/adapter'
+import { audit } from '@/lib/auth/audit'
 
-export const dynamic = "force-dynamic"
-export const runtime = "nodejs"
+export const runtime = 'nodejs'
 
-type Ctx = { params: Promise<{ name: string; identity: string; trackSid: string }> }
+export async function POST(
+  request: NextRequest,
+  context: { params: Promise<{ name: string; identity: string; trackSid: string }> }
+) {
+  const { name, identity, trackSid } = await context.params
+  const auth = await authenticate(request.headers)
+  if (!auth) return NextResponse.json({ error: 'unauthorized' }, { status: 401 })
 
-export async function POST(req: Request, ctx: Ctx) {
-  if (!isLiveKitConfigured()) {
-    return NextResponse.json({ error: "LiveKit is not configured." }, { status: 400 })
-  }
-  const { name, identity, trackSid } = await ctx.params
-  const room = decodeURIComponent(name)
-  const ident = decodeURIComponent(identity)
-  const sid = decodeURIComponent(trackSid)
+  let body: any
   try {
-    const body = (await req.json().catch(() => ({}))) as { muted?: boolean }
-    const svc = getRoomService()
-    await svc.mutePublishedTrack(room, ident, sid, body.muted ?? true)
-    return NextResponse.json({ ok: true })
-  } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "Unknown error" },
-      { status: 500 },
-    )
+    body = await request.json()
+  } catch {
+    return NextResponse.json({ error: 'invalid_json' }, { status: 400 })
+  }
+
+  const muted = body?.muted === true
+
+  try {
+    const adapter = getLiveKitAdapter()
+    await adapter.mutePublishedTrack(name, identity, trackSid, muted)
+    await audit({
+      adminId: auth.id,
+      adminEmail: auth.email,
+      action: 'track.mute',
+      targetType: 'track',
+      targetId: trackSid,
+      metadata: { room: name, identity, muted },
+    })
+    return NextResponse.json({ success: true })
+  } catch (_error) {
+    return NextResponse.json({ error: 'failed_to_mute_track' }, { status: 500 })
   }
 }

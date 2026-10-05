@@ -11,6 +11,10 @@ export interface LiveKitConfigStatus {
   connectionStatus: "connected" | "error" | "not_configured" | "unknown"
   roomCount: number
   error: string | null
+  /** Prometheus scrape target, or null when the endpoint is not configured. */
+  metricsUrl: string | null
+  databaseConfigured: boolean
+  sessionSecretConfigured: boolean
 }
 
 interface UseConfigReturn {

@@ -1,6 +1,8 @@
 # API Reference
 
-All API routes run on the Node.js runtime (`runtime: "nodejs"`) with dynamic rendering (`dynamic: "force-dynamic"`). They server-side call the LiveKit Server SDK and return JSON responses.
+All routes run on the Node.js runtime (`runtime: "nodejs"`) with dynamic rendering
+(`dynamic: "force-dynamic"`). They server-side call the LiveKit Server SDK through
+`lib/livekit/adapter` and return JSON.
 
 ## Base URL
 
@@ -8,13 +10,101 @@ When running locally: `http://localhost:3000/api`
 
 ---
 
+## Authentication
+
+Every route requires a dashboard session except the four listed below.
+
+`POST /api/auth/login` verifies the email and password against `dashboard_admins`
+using scrypt, issues an HMAC-signed session token in an HttpOnly cookie, and
+records the attempt in the audit log. `authenticate()` re-verifies the session
+row on each request, so a revoked or expired session stops working immediately
+rather than at token expiry.
+
+| Route | Auth | Notes |
+|-------|------|-------|
+| `POST /api/auth/login` | none | Sets the session cookie |
+| `POST /api/auth/logout` | optional | Always clears the cookie |
+| `GET /api/health` | none | Dashboard liveness, see below |
+| `POST /api/webhooks/livekit` | JWT signature | LiveKit's own `Authorization` header |
+| `GET /api/webhooks/livekit` | none | Informational text only |
+| `GET /api/stream` | at connect | See the SSE note below |
+
+Unauthenticated calls to a protected route return `401` with
+`{"error": "unauthorized"}`.
+
+The client sends the cookie automatically, so browser callers need nothing extra.
+Command-line callers need a cookie jar:
+
+```sh
+curl -c jar.txt -X POST http://localhost:3000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"ops@example.test","password":"..."}'
+curl -b jar.txt http://localhost:3000/api/rooms
+```
+
+### `POST /api/auth/login`
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `email` | string | Yes | |
+| `password` | string | Yes | |
+| `remember` | boolean | No | Only `true` counts; anything else gets the 30-minute idle window |
+
+**`200 OK`** — `{ "ok": true, "user": { "id", "email", "name", "role" } }`, plus
+`Set-Cookie` with `Max-Age` of `28800` when `remember` is `true` and `1800`
+otherwise. The idle window is stored per session row, and `authenticate()`
+renews expiry against that stored value — so an unremembered session stays at 30
+minutes of inactivity for its whole life instead of being silently extended by
+the sliding renewal.
+
+**Errors:** `400` `missing_credentials` or `invalid_json`, `401`
+`invalid_credentials`. A failed attempt is audited with `ok: false`.
+
+### `POST /api/auth/logout`
+
+Revokes the session server-side and clears the cookie. Returns `200 OK` even with
+no valid session, so logging out twice is not an error.
+
+---
+
+## Health
+
+### `GET /api/health`
+
+Liveness for the dashboard's own dependencies, distinct from LiveKit's own
+health. It answers "can the dashboard reach anything", so an empty UI can be
+attributed to a broken LiveKit server rather than a broken dashboard.
+
+Returns `200` even when a dependency is down — the dashboard is still serving, and
+a load balancer restarting it would not help. `ok` carries the verdict.
+
+```json
+{
+  "ok": true,
+  "livekit": {
+    "ok": true,
+    "roomService": true,
+    "egress": true,
+    "ingress": true,
+    "sip": true,
+    "agents": true
+  },
+  "events": { "storeConfigured": true, "streamSubscribers": 2 },
+  "checkedAt": "2026-10-05T08:00:00.000Z"
+}
+```
+
+`ok` is `livekit.ok && events.storeConfigured`: without a database there are no
+sessions and no event history, so the dashboard is not functional even if LiveKit
+answers.
+
+---
+
 ## Configuration
 
 ### `GET /api/config`
 
-Returns the current LiveKit connection status and configuration details.
-
-**Authentication:** None
+Cluster URL, whether credentials are set, and reachability.
 
 **Response:** `200 OK`
 
@@ -26,34 +116,19 @@ Returns the current LiveKit connection status and configuration details.
   "hasApiSecret": true,
   "region": "auto",
   "connectionStatus": "connected",
-  "roomCount": 3,
+  "roomCount": 1,
   "error": null
 }
 ```
 
-**Fields:**
+| `connectionStatus` | Meaning |
+|--------------------|---------|
+| `connected` | Reached the server |
+| `error` | Configured, but the call failed (see `error`) |
+| `not_configured` | Missing required env vars |
+| `unknown` | Not yet attempted |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `configured` | boolean | Whether all required env vars are set |
-| `url` | string | LiveKit server URL |
-| `hasApiKey` | boolean | Whether API key is present |
-| `hasApiSecret` | boolean | Whether API secret is present |
-| `region` | string | Region identifier |
-| `connectionStatus` | string | `"connected"`, `"error"`, `"not_configured"`, or `"unknown"` |
-| `roomCount` | number | Number of active rooms (only when connected) |
-| `error` | string | Error message if connection failed |
-
-**Connection Status Values:**
-
-| Status | Meaning |
-|--------|---------|
-| `connected` | Successfully connected to LiveKit server |
-| `error` | Configured but connection failed (see `error` field) |
-| `not_configured` | Missing required environment variables |
-| `unknown` | Connection not yet attempted |
-
-**Used by:** `useConfig()` hook on the dashboard page.
+**Used by:** `useConfig()`.
 
 ---
 
@@ -61,147 +136,97 @@ Returns the current LiveKit connection status and configuration details.
 
 ### `GET /api/rooms`
 
-Lists all active rooms on the LiveKit server.
-
-**Authentication:** None (relies on server-side env vars)
-
-**Response:** `200 OK`
-
 ```json
 {
   "rooms": [
     {
-      "id": "RM_abc123",
-      "sid": "RM_abc123",
-      "name": "meeting-room-1",
-      "participants": 4,
-      "publishers": 2,
-      "maxParticipants": 20,
-      "region": "auto",
-      "codec": "VP8",
-      "bitrate": 0,
-      "status": "live",
-      "createdAt": "2026-05-19T10:00:00.000Z",
-      "durationSeconds": 3600,
-      "recording": false,
-      "metadata": ""
+      "name": "phase3-room",
+      "sid": "RM_6Xc9xhhadqeJ",
+      "numParticipants": 0,
+      "numPublishers": 0,
+      "numSubscribers": null,
+      "emptyTimeout": 300,
+      "departureTimeout": null,
+      "maxParticipants": 8,
+      "creationTimeMs": "1791187397301",
+      "metadata": "{\"purpose\":\"verification\"}",
+      "activeRecording": false,
+      "turnPasswordPresent": false,
+      "codecs": ["audio/PCMU", "video/VP8"]
     }
   ]
 }
 ```
 
-**Error Response:** `400 Bad Request`
+`numSubscribers` and `departureTimeout` are `null` when absent from the installed
+protocol version, rather than `0`. `creationTimeMs` is a string because it exceeds
+what a JSON number should carry between JavaScript and Go.
 
-```json
-{ "error": "LiveKit is not configured." }
-```
-
-**Error Response:** `500 Internal Server Error`
-
-```json
-{ "error": "Connection refused" }
-```
-
-**Used by:** `useRooms()` hook (polls every 4 seconds).
-
----
+Audited as `room.list`. **Used by:** `useRooms()` (polls every 4s).
 
 ### `POST /api/rooms`
 
-Creates a new room on the LiveKit server.
+Creates a room. Audited as `room.create` with the room name as the target.
 
-**Request Body:**
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `name` | string | Yes | Room name as used by participants |
+| `maxParticipants` | number | No | Positive integer |
+| `metadata` | string | No | Passed through verbatim |
+| `emptyTimeout` | number | No | Seconds; server default when omitted |
+| `departureTimeout` | number | No | Seconds; LiveKit default when omitted |
+| `nodeId` | string | No | Pin the room to a node |
 
-```json
-{
-  "name": "new-room",
-  "emptyTimeout": 300,
-  "departureTimeout": 20,
-  "maxParticipants": 0,
-  "metadata": ""
-}
-```
+**`201 Created`** — `{ "room": { ...RoomDTO } }`, same shape as one entry of the
+list above.
 
-**Fields:**
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `name` | string | Yes | — | Unique room name |
-| `emptyTimeout` | number | No | 300 | Seconds to keep room alive after last participant leaves |
-| `departureTimeout` | number | No | 20 | Seconds to keep room alive after last publisher leaves |
-| `maxParticipants` | number | No | 0 | Maximum participants (0 = unlimited) |
-| `metadata` | string | No | `""` | Arbitrary metadata string |
-
-**Response:** `200 OK`
-
-```json
-{
-  "room": {
-    "sid": "RM_xyz789",
-    "name": "new-room"
-  }
-}
-```
-
-**Error Response:** `400 Bad Request`
-
-```json
-{ "error": "Room name is required." }
-```
-
-**Example:**
-
-```sh
-curl -X POST http://localhost:3000/api/rooms \
-  -H "Content-Type: application/json" \
-  -d '{"name": "standup-meeting"}'
-```
-
----
+**Errors:** `400` `invalid_json`, `invalid_name`, `invalid_max_participants`, or
+`invalid_timeouts`. A `name` that is already live returns `409 room_exists`.
 
 ### `GET /api/rooms/:name`
 
-Lists all participants in a specific room.
+One room, or `404` `not_found`. Audited as `room.get`. **Used by:** `useRoom()`.
 
-**URL Parameters:**
+### `DELETE /api/rooms/:name`
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `name` | string | Room name (URL-encoded if necessary) |
+Deletes the room. Audited as `room.delete`.
 
-**Response:** `200 OK`
+`404` `not_found` when the room is not live, including the case where it ended on
+its own between the operator's list refresh and this call — the caller's intent
+is satisfied either way, and distinguishing it from a cluster outage matters.
+`500` only when the cluster cannot be reached.
+
+### `GET /api/rooms/:name/participants`
 
 ```json
 {
-  "room": "meeting-room-1",
   "participants": [
     {
-      "id": "PA_abc123",
-      "sid": "PA_abc123",
       "identity": "user-123",
+      "sid": "PA_abc",
+      "state": "ACTIVE",
+      "joinedAtMs": "1791187397301",
       "name": "John Doe",
-      "role": "publisher",
-      "audio": true,
-      "video": true,
-      "screen": false,
-      "bitrateKbps": 0,
-      "quality": "good",
-      "device": "unknown",
-      "browser": "unknown",
-      "region": "auto",
-      "pingMs": 0,
-      "packetLoss": 0,
-      "joinedAt": "2026-05-19T10:05:00.000Z",
-      "state": {},
-      "metadata": "",
+      "metadata": null,
+      "attributes": {},
+      "isPublisher": true,
+      "canPublish": true,
+      "canSubscribe": true,
+      "canPublishData": false,
       "tracks": [
         {
-          "sid": "TR_audio1",
-          "type": 0,
-          "source": 1,
-          "muted": false,
+          "sid": "TR_1",
+          "type": "AUDIO",
+          "source": "MICROPHONE",
           "name": "audio",
-          "mimeType": "audio/opus"
+          "muted": false,
+          "stream": null,
+          "simulcast": false,
+          "mid": null,
+          "width": null,
+          "height": null,
+          "codecMime": "audio/opus",
+          "layers": 0
         }
       ]
     }
@@ -209,75 +234,25 @@ Lists all participants in a specific room.
 }
 ```
 
-**Participant Fields:**
+Track `type` is `"AUDIO" | "VIDEO" | "DATA" | "UNKNOWN"` and `source` is
+`"CAMERA" | "MICROPHONE" | "SCREEN_SHARE" | "SCREEN_SHARE_AUDIO" | "UNKNOWN"` —
+named, not the numeric protocol enums, so a reordering upstream cannot silently
+reinterpret the UI.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `identity` | string | Unique participant identifier |
-| `name` | string | Display name (falls back to identity) |
-| `role` | string | `"publisher"` or `"viewer"` |
-| `audio` | boolean | Has active audio track |
-| `video` | boolean | Has active video track |
-| `screen` | boolean | Is screen sharing |
-| `tracks` | array | List of published tracks with details |
+**The server does not report per-participant RTT, packet loss, bitrate, device, or
+browser.** Those fields existed only in the mock data and are not returned. The
+UI shows `n/a` instead of a number it cannot obtain.
 
-**Track Types:**
+Audited as `participant.list`. **Used by:** `useParticipants()` (polls every 3s).
 
-| `type` | Meaning |
-|--------|---------|
-| 0 | Audio |
-| 1 | Video |
+### `DELETE /api/rooms/:name/participants/:identity`
 
-**Track Sources:**
+Removes a participant. Audited as `participant.kick` with the room in `metadata`.
+Returns `{ "success": true }`.
 
-| `source` | Meaning |
-|----------|---------|
-| 0 | Unknown |
-| 1 | Camera |
-| 2 | Microphone |
-| 3 | Screen share |
+### `POST /api/rooms/:name/participants/:identity/tracks/:trackSid/mute`
 
-**Used by:** `useParticipants()` hook (polls every 3 seconds).
-
----
-
-### `DELETE /api/rooms/:name`
-
-Deletes a room or removes a specific participant.
-
-**URL Parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `name` | string | Room name |
-
-**Query Parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `identity` | string | (Optional) Participant identity to remove. If omitted, deletes the entire room. |
-
-**Delete Room Response:** `200 OK`
-
-```json
-{ "ok": true }
-```
-
-**Remove Participant Response:** `200 OK`
-
-```json
-{ "ok": true }
-```
-
-**Examples:**
-
-```sh
-# Delete entire room
-curl -X DELETE http://localhost:3000/api/rooms/meeting-room-1
-
-# Remove specific participant
-curl -X DELETE "http://localhost:3000/api/rooms/meeting-room-1?identity=user-123"
-```
+Body: `{ "muted": boolean }`. Audited as `track.mute`. Returns `{ "success": true }`.
 
 ---
 
@@ -285,98 +260,64 @@ curl -X DELETE "http://localhost:3000/api/rooms/meeting-room-1?identity=user-123
 
 ### `POST /api/tokens`
 
-Generates a signed JWT access token for a participant to join a room.
+Mints a participant access token. **Authenticated and audited**
+(`token.create`, with room and publish rights in `metadata`): this route holds the
+cluster API secret and will mint a token for any identity the caller names, so
+leaving it open is an unauthenticated way into every room.
 
-**Request Body:**
+**Request body:** the grant fields. Every field is optional except `identity`.
+Booleans default to *absent*, not `false` — LiveKit reads an absent grant as
+"default", and `canPublishData` defaults to `true`, so sending an explicit
+`false` is a real decision rather than a no-op.
 
-```json
-{
-  "identity": "user-123",
-  "room": "meeting-room-1",
-  "canPublish": true,
-  "canSubscribe": true,
-  "canPublishData": false,
-  "ttlSeconds": 3600,
-  "name": "John Doe"
-}
-```
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `identity` | string | Yes | Non-empty |
+| `room` | string | No | `""` joins any room the participant is allowed into |
+| `roomJoin` | boolean | No | |
+| `canPublish` | boolean | No | |
+| `canSubscribe` | boolean | No | |
+| `canPublishData` | boolean | No | LiveKit defaults this to `true` when unset |
+| `canPublishSources` | string[] | No | `camera`, `microphone`, `screen_share`, `screen_share_audio` |
+| `canUpdateOwnMetadata` | boolean | No | |
+| `hidden` | boolean | No | Participant hidden from other participants |
+| `recorder` | boolean | No | |
+| `roomCreate`, `roomList` | boolean | No | |
+| `roomRecord` | boolean | No | |
+| `roomAdmin` | boolean | No | |
+| `ingressAdmin`, `sipAdmin`, `sipCall` | boolean | No | |
+| `ttlSeconds` | number | No | Defaults to 21600; must be positive and at most 86400 |
+| `name` | string | No | Display name |
+| `metadata` | string | No | Free-form JSON handed to the participant on join |
 
-**Fields:**
+`canPublishSources` takes the public names above. The route maps them to the
+protocol's `TrackSource` values and rejects an unknown name rather than
+silently dropping it — a token that grants fewer rights than the form showed was
+the original bug this guards against.
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `identity` | string | Yes | — | Unique participant identifier |
-| `room` | string | No | `""` | Room name to join |
-| `canPublish` | boolean | No | `false` | Allow publishing audio/video tracks |
-| `canSubscribe` | boolean | No | `false` | Allow subscribing to other participants' tracks |
-| `canPublishData` | boolean | No | `false` | Allow publishing data messages |
-| `ttlSeconds` | number | No | 21600 (6 hours) | Token time-to-live in seconds |
-| `name` | string | No | — | Display name for the participant |
+**`200 OK`:** `{ "token", "url", "identity", "expiresIn" }`.
 
-**Response:** `200 OK`
-
-```json
-{
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2aWRlbyI6eyJyb29tSm9pbiI6dHJ1ZSwicm9vbSI6Im1lZXRpbmctcm9vbS0xIiwiY2FuUHVibGlzaCI6dHJ1ZSwiY2FuU3Vic2NyaWJlIjp0cnVlLCJjYW5QdWJsaXNoRGF0YSI6ZmFsc2V9LCJpc3MiOiJkZXZrZXkiLCJzdWIiOiJ1c2VyLTEyMyIsIm5hbWUiOiJKb2huIERvZSIsImV4cCI6MTcxNjEwMDAwMH0.abc123signature",
-  "url": "http://localhost:7880",
-  "identity": "user-123",
-  "expiresIn": 3600
-}
-```
-
-**Error Response:** `400 Bad Request`
-
-```json
-{ "error": "identity is required." }
-```
-
-**Error Response:** `400 Bad Request`
-
-```json
-{ "error": "LiveKit is not configured." }
-```
-
-**Example:**
-
-```sh
-curl -X POST http://localhost:3000/api/tokens \
-  -H "Content-Type: application/json" \
-  -d '{
-    "identity": "viewer-456",
-    "room": "webinar-room",
-    "canSubscribe": true,
-    "ttlSeconds": 7200
-  }'
-```
-
-**Using the Token:**
-
-The generated token can be used with the LiveKit client SDK to connect to a room:
-
-```javascript
-import { Room } from 'livekit-client'
-
-const room = new Room()
-await room.connect('http://localhost:7880', 'eyJhbGciOiJIUzI1NiIs...')
-```
+**Errors:** `400` with a specific message for a non-object body, a missing or
+non-string `identity`, a non-string `room`/`name`/`metadata`, a non-boolean
+grant, a non-positive or over-24-hour `ttlSeconds`, a `canPublishSources` that
+is not an array of strings, or an unrecognised track source. `400`
+`LiveKit is not configured.` when credentials are missing.
 
 ---
 
-## Egress (Recording)
+## Egress
 
 ### `GET /api/egress`
 
-Lists all active and completed recording sessions.
-
-**Response:** `200 OK`
+Lists egress entries, active and completed.
 
 ```json
 {
   "egresses": [
     {
-      "egressId": "EG_abc123",
+      "egressId": "EG_abc",
       "roomName": "meeting-room-1",
-      "roomId": "RM_abc123",
+      "roomId": "RM_abc",
       "status": "EGRESS_ACTIVE",
       "startedAt": 1716090000000,
       "endedAt": 0,
@@ -387,99 +328,56 @@ Lists all active and completed recording sessions.
 }
 ```
 
-**Egress Status Values:**
-
-| Status | Meaning |
-|--------|---------|
-| `EGRESS_STARTING` | Recording is initializing |
-| `EGRESS_ACTIVE` | Recording is in progress |
-| `EGRESS_ENDING` | Recording is stopping |
-| `EGRESS_COMPLETE` | Recording finished successfully |
-| `EGRESS_FAILED` | Recording failed (see `error` field) |
-
-**Used by:** `useEgress()` hook (polls every 5 seconds).
-
----
+`mock` is always `false`; egress comes from the server.
 
 ### `POST /api/egress`
 
-Starts or stops a room recording.
+Starts or stops a recording. **Authenticated and audited** (`egress.start`,
+`egress.stop`) — an unauthenticated caller could otherwise record any room.
 
-**Request Body — Start Recording:**
+**Start:** `{ "action": "start", "roomName", "filepath"?, "audioOnly"? }`.
+Writes MP4 via `EncodedFileOutput`, layout `speaker`,
+`EncodingOptionsPreset.H264_720P_30`.
 
-```json
-{
-  "action": "start",
-  "roomName": "meeting-room-1",
-  "filepath": "recordings/meeting-room-1-{time}.mp4",
-  "audioOnly": false
-}
-```
+**Stop:** `{ "action": "stop", "egressId" }`.
 
-**Request Body — Stop Recording:**
+**Errors:** `400` invalid request or not configured, `500` server failure.
 
-```json
-{
-  "action": "stop",
-  "egressId": "EG_abc123"
-}
-```
+---
 
-**Fields:**
+## Participants across rooms
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `action` | string | Yes | `"start"` or `"stop"` |
-| `roomName` | string | Yes (for start) | Room to record |
-| `egressId` | string | Yes (for stop) | Egress session ID to stop |
-| `filepath` | string | No | Output file path pattern (supports `{time}` placeholder) |
-| `audioOnly` | boolean | No | Record audio only (default: false) |
+### `GET /api/users`
 
-**Start Response:** `200 OK`
+Searches participants cluster-wide. `?room=` returns that room's list through the
+adapter; otherwise every room is scanned and rooms that error are skipped rather
+than failing the request. `?identity=` filters to one identity.
 
 ```json
 {
-  "ok": true,
-  "egress": {
-    "egressId": "EG_xyz789",
-    "status": "EGRESS_STARTING",
-    "roomName": "meeting-room-1"
-  }
+  "participants": [
+    {
+      "room": "phase3-room",
+      "identity": "user-123",
+      "sid": "PA_abc",
+      "state": "ACTIVE",
+      "isPublisher": true,
+      "trackCount": 2,
+      "joinedAt": "2026-10-05T08:03:17.301Z"
+    }
+  ],
+  "totalRooms": 1,
+  "totalParticipants": 3
 }
 ```
 
-**Stop Response:** `200 OK`
+`totalParticipants` is omitted when filtering by identity. `joinedAt` is derived
+from `joinedAtMs` as **milliseconds**.
 
-```json
-{
-  "ok": true,
-  "egress": {
-    "egressId": "EG_abc123",
-    "status": "EGRESS_ENDING"
-  }
-}
-```
+### `DELETE /api/users`
 
-**Recording Details:**
-
-- Output format: MP4
-- Encoding: H.264 720p @ 30fps
-- Layout: Speaker view
-- Default filepath pattern: `recordings/{roomName}-{time}.mp4`
-
-**Examples:**
-
-```sh
-# Start recording
-curl -X POST http://localhost:3000/api/egress \
-  -H "Content-Type: application/json" \
-  -d '{"action":"start","roomName":"webinar"}'
-
-# Stop recording
-curl -X POST http://localhost:3000/api/egress \
-  -H "Content-Type: application/json" \
-  -d '{"action":"stop","egressId":"EG_abc123"}'
-```
+Body `{ "room", "identity" }`. Removes the participant. Audited as
+`participant.remove`. Returns `{ "ok": true }`.
 
 ---
 
@@ -487,64 +385,37 @@ curl -X POST http://localhost:3000/api/egress \
 
 ### `POST /api/webhooks/livekit`
 
-Receives webhook events from the LiveKit server.
+Receives webhook events. The `Authorization` header is verified with the LiveKit
+SDK's receiver; an unsigned or tampered body is rejected with `401` before any
+parsing.
 
-**Configure your LiveKit server** to send webhook events to this endpoint:
+Configure the server:
 
 ```yaml
-# In your LiveKit server config
 webhook:
   urls:
-    - http://your-domain/api/webhooks/livekit
+    - http://localhost:3000/api/webhooks/livekit
 ```
 
-**Headers:**
-
-| Header | Value | Description |
-|--------|-------|-------------|
-| `Content-Type` | `application/webhook+json` | Required |
-| `Authorization` | `<JWT>` | Signed with your API key/secret |
-
-**Request Body:** Raw webhook JSON payload from LiveKit server.
-
-**Response:** `200 OK`
-
-```json
-{ "ok": true }
-```
-
-**Error Response:** `401 Unauthorized`
-
-```json
-{ "error": "Invalid webhook" }
-```
-
-**Local Development:**
-
-For local development, use a tunnel service to expose your localhost:
+For a remote server, use a tunnel:
 
 ```sh
 ngrok http 3000
-# Then configure LiveKit webhook URL to: https://abc123.ngrok.io/api/webhooks/livekit
+# then set the webhook URL to https://abc123.ngrok.io/api/webhooks/livekit
 ```
 
-**Event Storage:**
+On success the event is written to PostgreSQL (`dashboard_webhook_events`, keyed
+by LiveKit's event id, so a redelivery does not duplicate a row) and then
+published on the in-process SSE bus. **A store failure does not fail the
+request** — LiveKit would retry, and a retry storm against a slow database is
+worse than one event only visible on the next poll.
 
-Received events are stored in-memory (max 500) and can be retrieved via `GET /api/events`.
-
----
+**Responses:** `200` `{ "ok": true, "stored": true | false }` (`stored: false`
+means the event was a redelivery), `401` invalid signature, `400` invalid JSON.
 
 ### `GET /api/webhooks/livekit`
 
-Returns informational response about the webhook endpoint.
-
-**Response:** `200 OK`
-
-```json
-{
-  "info": "POST LiveKit webhook events here. Set Content-Type: application/webhook+json."
-}
-```
+Informational text. No auth, no data.
 
 ---
 
@@ -552,48 +423,59 @@ Returns informational response about the webhook endpoint.
 
 ### `GET /api/events`
 
-Returns the list of recorded webhook events.
+Webhook events from PostgreSQL, newest first.
 
-**Query Parameters:**
+**Query parameters:**
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `limit` | number | 100 | Maximum number of events to return |
-
-**Response:** `200 OK`
+| Parameter | Type | Default | Notes |
+|-----------|------|---------|-------|
+| `limit` | number | 100 | Clamped to 1-1000 |
+| `room` | string | all | Indexed in SQL |
+| `type` | string | all | Indexed in SQL |
+| `participant` | string | all | Filtered in JS; no index |
+| `since` | number | none | Unix seconds, filtered in JS |
 
 ```json
 {
   "events": [
     {
-      "id": "evt_abc123",
+      "id": "evt_abc",
       "event": "room_started",
-      "createdAt": 1716090000,
-      "room": "meeting-room-1",
+      "createdAt": 1759641600,
+      "room": "phase3-room",
       "participant": null,
-      "raw": {
-        "event": "room_started",
-        "room": { "name": "meeting-room-1", "sid": "RM_abc123" }
-      }
+      "raw": { "event": "room_started" }
     }
-  ]
+  ],
+  "filters": { "rooms": ["phase3-room"], "participants": [], "eventTypes": ["room_started"] }
 }
 ```
 
-**Common Event Types:**
+Audited as `events.list`. **Used by:** `useEventStream()` for the fallback poll,
+`useRoomEvents()` for a room's own history.
 
-| Event | Description |
-|-------|-------------|
-| `room_started` | A new room was created |
-| `room_finished` | A room was deleted |
-| `participant_joined` | A participant joined a room |
-| `participant_left` | A participant left a room |
-| `track_published` | A track was published |
-| `track_unpublished` | A track was unpublished |
-| `egress_started` | A recording session started |
-| `egress_ended` | A recording session ended |
+### `DELETE /api/events`
 
-**Note:** Events are stored in-memory and reset on every redeploy. For production, persist to a database.
+Clears the event log. Audited as `events.clear`. Requires an explicit confirmation
+in the UI.
+
+### `GET /api/stream`
+
+Server-sent events. Query `?room=` scopes the stream; `all` or absent means
+everything.
+
+Event names: `ready` on connect, `webhook` per event, plus a `: keep-alive`
+comment every 25s.
+
+Two things worth knowing:
+
+- **Auth is checked once at connect.** `EventSource` cannot send headers, so the
+  cookie is the only credential; a session revoked after connecting keeps its open
+  stream until it closes or the heartbeat notices.
+- **The bus is in-process.** Two dashboard instances each see only their own
+  webhooks. PostgreSQL is the source of truth and the client polls every 10s, so
+  nothing is lost — but a multi-instance deployment needs shared pub/sub for
+  sub-second delivery.
 
 ---
 
@@ -601,49 +483,163 @@ Returns the list of recorded webhook events.
 
 ### `GET /api/monitoring`
 
-Returns system metrics and health information.
+Room aggregates from the RoomService, process and media metrics from the
+Prometheus endpoint, and stored history for the charts.
 
-**Response:** `200 OK`
+**Requires `LIVEKIT_METRICS_URL`.** Without it every metric below is `null` and
+`system.available` is `false` — nothing is substituted.
 
 ```json
 {
-  "cpu": 45.2,
-  "memory": 68.1,
-  "disk": 32.5,
-  "network": {
-    "in": 1250,
-    "out": 3400
-  }
+  "rooms": { "total": 1, "active": 0 },
+  "participants": { "total": 0, "publishers": 0, "avgPerRoom": 0 },
+  "capacity": { "max": 8, "utilization": 0 },
+  "recordings": {
+    "active": 0,
+    "egress": [
+      {
+        "id": "EG_abc",
+        "roomName": "phase3-room",
+        "status": "active",
+        "startedAt": "2026-10-05T08:03:17.301Z"
+      }
+    ]
+  },
+  "roomDetails": [
+    {
+      "name": "phase3-room",
+      "sid": "RM_6Xc9xhhadqeJ",
+      "participants": 0,
+      "publishers": 0,
+      "maxParticipants": 8,
+      "recording": false,
+      "createdAt": "2026-10-05T08:03:17.301Z",
+      "metadata": ""
+    }
+  ],
+  "system": {
+    "available": true,
+    "error": null,
+    "cpuPercent": 0.31,
+    "ramBytes": 60612608,
+    "heapBytes": 12492800,
+    "goroutines": 151,
+    "openFds": 27,
+    "uptimeSeconds": 2180.61,
+    "networkRxBytes": 3100021355,
+    "networkTxBytes": 2334386354,
+    "host": null
+  },
+  "webrtc": {
+    "jitterSeconds": 0,
+    "latencyMsAvg": null,
+    "latencyMsP95": null,
+    "packetLossRatio": null,
+    "packetsOut": 0,
+    "packetsDropped": 0
+  },
+  "quality": { "scoreAvg": null, "scoreCount": 0 },
+  "webhooks": { "dispatched": 9, "failed": 1, "queueLengthAvg": 1 },
+  "metrics": {
+    "rooms": { "total": 0, "avgDurationSeconds": 48.08 },
+    "participants": { "connected": 0, "total": null },
+    "transports": { "packetsOut": 0, "packetsDropped": 0, "packetLossRatio": null },
+    "quality": { "scoreAvg": null, "scoreCount": 0 },
+    "webrtc": { "jitterSeconds": 0, "latencyMsAvg": null, "latencyMsP95": null },
+    "api": { "twirpLatencyMsAvg": 1.33 }
+  },
+  "history": [
+    {
+      "at": "2026-10-05T08:02:36.495Z",
+      "rooms": 0,
+      "participants": 0,
+      "packetsOut": 0,
+      "packetsDropped": 0,
+      "packetLossRatio": null,
+      "qualityScore": null,
+      "latencyMs": null,
+      "cpuSecondsTotal": 8.07,
+      "cpuPercent": 0.31,
+      "residentMemoryBytes": 60612608,
+      "webhooksFailed": 1
+    }
+  ],
+  "collectedAt": "2026-10-05T08:02:41.000Z"
 }
 ```
+
+Notes on the nulls, since they are the point:
+
+- **`system.host` is always `null`.** The Prometheus series describe the
+  livekit-server *process*, not the machine under it. Reporting host CPU would
+  require reaching outside this service.
+- **`webrtc.latencyMsP95` is always `null`.** LiveKit exports
+  `livekit_forward_latency_ns_sum`/`_count` but no buckets, so a quantile cannot
+  be derived without inventing a distribution.
+- **`metrics.participants.total` is `null`.** `livekit_participant_total` is a
+  gauge of current connections, not a cumulative counter.
+- **`metrics.api.twirpLatencyMsAvg` is control-plane latency**, kept separate from
+  `webrtc.latencyMsAvg`, which comes from the media forwarding histogram. They are
+  different things and the route never substitutes one for the other.
+- **`cpuPercent` is null on the first sample of a window.** `process_cpu_seconds_total`
+  is a counter, so a percentage is a delta between two stored samples. The first
+  point has no baseline. Deriving it in the store rather than in memory means the
+  value survives a dashboard restart.
+- **History keeps a null point where a sample was unavailable.** The point stays
+  in the series with every metric `null`, and charts render it with
+  `connectNulls={false}`, so an outage shows as a gap rather than a flat line
+  implying steady state. Dropping the row entirely, or bridging across it, would
+  both misrepresent the outage. A metric that recovers also gets no value on its
+  first sample, because there is no baseline to compute a delta from.
+  Snapshots are rate-limited to one per 30 seconds; retention is 24 hours,
+  enforced on write since there is no scheduler.
+- **`recordings.active` counts rooms, not jobs.** It is the union of active
+  egress jobs and rooms flagged `activeRecording`, deduplicated by room name. A
+  room carrying the flag is normally the same job the egress list reports, so
+  summing the two counted one recording twice.
+
+Charts on the dashboard and monitoring pages read `history`. They have no internal
+timer and generate nothing: a chart that invents points looks alive while telling
+you nothing.
+
+**Per-room metrics are not available.** LiveKit labels media series with
+`node_id`, never with a room name, so per-room CPU, bitrate, or packet loss cannot
+be read from this endpoint and is not charted.
+
+**Used by:** `useMonitoring()` (polls every 5s, aborts in flight).
 
 ---
 
 ## Error Handling
 
-All API routes follow a consistent error response format:
-
-```json
-{
-  "error": "Human-readable error message"
-}
-```
-
-**HTTP Status Codes:**
+Errors are `{"error": "<code or message>"}`. Codes are machine-readable
+(`unauthorized`, `not_found`, `invalid_credentials`); LiveKit errors are passed
+through as their message.
 
 | Code | Meaning |
 |------|---------|
 | 200 | Success |
-| 400 | Bad request (missing params, not configured) |
-| 401 | Unauthorized (invalid webhook signature) |
-| 500 | Internal server error (LiveKit connection failed) |
+| 307 | Redirect to `/login` for an unauthenticated page request |
+| 400 | Bad request, or LiveKit not configured |
+| 401 | Unauthenticated, or an invalid webhook signature |
+| 404 | Room does not exist |
+| 500 | Upstream failure |
 
----
+## Audit log
 
-## Rate Limiting
+Mutating and read operations are written to `dashboard_audit_log` with the admin
+id, email, action, target, and redacted metadata. Recorded actions include
+`auth.login`, `auth.logout`, `auth.login_failed`, `room.list`, `room.get`,
+`room.delete`, `participant.list`, `participant.kick`, `participant.remove`,
+`track.mute`, `token.create`, `egress.start`, `egress.stop`, `events.list`,
+`events.clear`, and `webhook.received`.
 
-There is **no rate limiting** implemented in this starter template. For production, consider:
+## Rate limiting
 
-- Adding rate limiting middleware (e.g., `@upstash/ratelimit`)
-- Using a reverse proxy with rate limiting (nginx, Cloudflare)
-- Implementing per-IP or per-token rate limits
+There is no per-IP rate limiting on dashboard routes. Put a rate limiter in front
+of the deployment (nginx, Cloudflare, `@upstash/ratelimit`) — `/api/auth/login`
+is the endpoint worth protecting first.
+
+The metrics endpoint is not rate limited either; instead `/api/monitoring`
+collapses concurrent scrapes behind a 2-second cache, so N open tabs cost one
+request to Prometheus, not N.

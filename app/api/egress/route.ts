@@ -1,11 +1,23 @@
-import { NextResponse } from "next/server"
+import { NextRequest, NextResponse } from "next/server"
+import { authenticate } from "@/lib/auth/session"
+import { audit } from "@/lib/auth/audit"
 import { isLiveKitConfigured, getEgressClient } from "@/lib/livekit-server"
 import { EncodedFileType, EncodedFileOutput, EncodingOptionsPreset } from "livekit-server-sdk"
 
 export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
-export async function GET() {
+/**
+ * Egress list and control.
+ *
+ * POST starts and stops recordings, so it is authenticated and audited like the
+ * other mutating routes — an unauthenticated caller could otherwise record any
+ * room.
+ */
+export async function GET(req: NextRequest) {
+  const identity = await authenticate(req.headers)
+  if (!identity) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
+
   if (!isLiveKitConfigured()) {
     return NextResponse.json(
       { error: "LiveKit is not configured." },
@@ -35,7 +47,10 @@ export async function GET() {
   }
 }
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
+  const identity = await authenticate(req.headers)
+  if (!identity) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
+
   if (!isLiveKitConfigured()) {
     return NextResponse.json({ error: "LiveKit is not configured." }, { status: 400 })
   }
@@ -50,6 +65,13 @@ export async function POST(req: Request) {
     const client = getEgressClient()
     if (body.action === "stop" && body.egressId) {
       const info = await client.stopEgress(body.egressId)
+      await audit({
+        adminId: identity.id,
+        adminEmail: identity.email,
+        action: 'egress.stop',
+        targetType: 'egress',
+        targetId: body.egressId,
+      })
       return NextResponse.json({ ok: true, egress: { egressId: info.egressId, status: info.status } })
     }
     if (body.action === "start" && body.roomName) {
@@ -61,6 +83,14 @@ export async function POST(req: Request) {
         layout: "speaker",
         audioOnly: body.audioOnly ?? false,
         encodingOptions: EncodingOptionsPreset.H264_720P_30,
+      })
+      await audit({
+        adminId: identity.id,
+        adminEmail: identity.email,
+        action: 'egress.start',
+        targetType: 'room',
+        targetId: body.roomName,
+        metadata: { egressId: info.egressId },
       })
       return NextResponse.json({
         ok: true,

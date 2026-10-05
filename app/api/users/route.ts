@@ -1,106 +1,105 @@
-import { NextResponse } from "next/server"
-import { isLiveKitConfigured, getRoomService } from "@/lib/livekit-server"
+import { NextRequest, NextResponse } from "next/server"
+import { authenticate } from "@/lib/auth/session"
+import { audit } from "@/lib/auth/audit"
+import { isLiveKitConfigured } from "@/lib/livekit-server"
+import { getLiveKitAdapter } from "@/lib/livekit/adapter"
+import type { ParticipantDTO, RoomDTO } from "@/lib/livekit/adapter"
 
 export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
-export async function GET(req: Request) {
+/**
+ * Participant search across the cluster.
+ *
+ * This predates `lib/livekit/adapter` and used to build its own shape with raw
+ * `RoomService` calls, including a `new Date(joinedAt * 1000)` conversion that
+ * was wrong: LiveKit reports `joinedAt` in milliseconds, so every join time was
+ * off by three orders of magnitude. It now delegates to the adapter, and DELETE
+ * removes a participant, so both verbs are authenticated and audited.
+ */
+
+function flatten(rooms: RoomDTO[], participantsByRoom: Map<string, ParticipantDTO[]>) {
+  const out: Array<{
+    room: string
+    identity: string
+    sid: string
+    state: ParticipantDTO['state']
+    isPublisher: boolean
+    trackCount: number
+    joinedAt: string | null
+  }> = []
+  for (const room of rooms) {
+    for (const p of participantsByRoom.get(room.name) ?? []) {
+      out.push({
+        room: room.name,
+        identity: p.identity,
+        sid: p.sid,
+        state: p.state,
+        isPublisher: p.isPublisher,
+        trackCount: p.tracks.length,
+        joinedAt: p.joinedAtMs ? new Date(Number(p.joinedAtMs)).toISOString() : null,
+      })
+    }
+  }
+  return out
+}
+
+/** One participant list per room; a room that errors is skipped, not fatal. */
+async function participantsByRoom(rooms: RoomDTO[]) {
+  const adapter = getLiveKitAdapter()
+  const entries = await Promise.all(
+    rooms.map(async (room) => {
+      try {
+        return [room.name, await adapter.listParticipants(room.name)] as const
+      } catch {
+        return [room.name, [] as ParticipantDTO[]] as const
+      }
+    }),
+  )
+  return new Map(entries)
+}
+
+export async function GET(req: NextRequest) {
+  const identity = await authenticate(req.headers)
+  if (!identity) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
+
   if (!isLiveKitConfigured()) {
     return NextResponse.json({ error: "LiveKit is not configured." }, { status: 400 })
   }
 
   const url = new URL(req.url)
-  const identity = url.searchParams.get("identity")
-  const room = url.searchParams.get("room")
+  const searchIdentity = url.searchParams.get("identity")
+  const roomName = url.searchParams.get("room")
 
   try {
-    const svc = getRoomService()
+    const adapter = getLiveKitAdapter()
 
-    // If searching for a specific identity across all rooms
-    if (identity) {
-      const rooms = await svc.listRooms()
-      const results: Array<{ room: string; participant: any }> = []
-
-      for (const r of rooms) {
-        try {
-          const participants = await svc.listParticipants(r.name)
-          const found = participants.find((p) => p.identity === identity)
-          if (found) {
-            results.push({ room: r.name, participant: found })
-          }
-        } catch {
-          // Skip rooms where we can't fetch participants
-        }
-      }
-
-      return NextResponse.json({ participants: results })
+    if (roomName) {
+      const participants = await adapter.listParticipants(roomName)
+      await audit({
+        adminId: identity.id,
+        adminEmail: identity.email,
+        action: "participant.list",
+        targetType: "room",
+        targetId: roomName,
+        metadata: { count: participants.length },
+      })
+      return NextResponse.json({ room: roomName, participants })
     }
 
-    // If fetching participants for a specific room
-    if (room) {
-      const participants = await svc.listParticipants(room)
-      const mapped = participants.map((p) => ({
-        id: p.sid,
-        sid: p.sid,
-        identity: p.identity,
-        name: p.name || p.identity,
-        role: p.permission?.canPublish ? "publisher" : "viewer",
-        audio: p.tracks?.some((t) => t.type === 0 && !t.muted) ?? false,
-        video: p.tracks?.some((t) => t.type === 1 && !t.muted) ?? false,
-        screen: p.tracks?.some((t) => t.source === 3) ?? false,
-        joinedAt: new Date(Number(p.joinedAt ?? 0) * 1000).toISOString(),
-        state: p.state,
-        metadata: p.metadata ?? "",
-        tracks: (p.tracks ?? []).map((t) => ({
-          sid: t.sid,
-          type: t.type,
-          source: t.source,
-          muted: t.muted,
-          name: t.name,
-          mimeType: t.mimeType,
-        })),
-      }))
-      return NextResponse.json({ room, participants: mapped })
-    }
+    const rooms = await adapter.listRooms()
+    const byRoom = await participantsByRoom(rooms)
+    const all = flatten(rooms, byRoom)
 
-    // Fetch all participants across all rooms
-    const rooms = await svc.listRooms()
-    const allParticipants: Array<{
-      id: string
-      identity: string
-      name: string
-      room: string
-      role: string
-      audio: boolean
-      video: boolean
-      screen: boolean
-      joinedAt: string
-      state: string
-    }> = []
+    const participants = searchIdentity
+      ? all.filter((p) => p.identity === searchIdentity)
+      : all
 
-    for (const r of rooms) {
-      try {
-        const participants = await svc.listParticipants(r.name)
-        for (const p of participants) {
-          allParticipants.push({
-            id: p.sid,
-            identity: p.identity,
-            name: p.name || p.identity,
-            room: r.name,
-            role: p.permission?.canPublish ? "publisher" : "viewer",
-            audio: p.tracks?.some((t) => t.type === 0 && !t.muted) ?? false,
-            video: p.tracks?.some((t) => t.type === 1 && !t.muted) ?? false,
-            screen: p.tracks?.some((t) => t.source === 3) ?? false,
-            joinedAt: new Date(Number(p.joinedAt ?? 0) * 1000).toISOString(),
-            state: p.state ?? "active",
-          })
-        }
-      } catch {
-        // Skip rooms where we can't fetch participants
-      }
-    }
-
-    return NextResponse.json({ participants: allParticipants, totalRooms: rooms.length })
+    return NextResponse.json({
+      participants,
+      totalRooms: rooms.length,
+      ...(searchIdentity ? {} : { totalParticipants: all.length }),
+    })
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Unknown error" },
@@ -109,21 +108,32 @@ export async function GET(req: Request) {
   }
 }
 
-export async function DELETE(req: Request) {
+export async function DELETE(req: NextRequest) {
+  const identity = await authenticate(req.headers)
+  if (!identity) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
+
   if (!isLiveKitConfigured()) {
     return NextResponse.json({ error: "LiveKit is not configured." }, { status: 400 })
   }
 
   try {
     const body = await req.json()
-    const { room, identity } = body
+    const { room, identity: participantIdentity } = body ?? {}
 
-    if (!room || !identity) {
+    if (!room || !participantIdentity) {
       return NextResponse.json({ error: "Room and identity are required." }, { status: 400 })
     }
 
-    const svc = getRoomService()
-    await svc.removeParticipant(room, identity)
+    const adapter = getLiveKitAdapter()
+    await adapter.removeParticipant(room, participantIdentity)
+    await audit({
+      adminId: identity.id,
+      adminEmail: identity.email,
+      action: "participant.remove",
+      targetType: "room",
+      targetId: room,
+      metadata: { participant: participantIdentity },
+    })
     return NextResponse.json({ ok: true })
   } catch (err) {
     return NextResponse.json(

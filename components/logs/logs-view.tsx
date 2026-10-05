@@ -7,7 +7,8 @@ import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import type { StoredWebhookEvent } from "@/lib/webhook-store"
+import type { StoredWebhookEvent } from "@/lib/events/types"
+import { useEventStream } from "@/hooks/useEventStream"
 import { useI18n } from "@/lib/i18n"
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
@@ -43,7 +44,11 @@ export function LogsView() {
   const [roomFilter, setRoomFilter] = useState("all")
   const [eventTypeFilter, setEventTypeFilter] = useState("all")
   const containerRef = useRef<HTMLDivElement>(null)
-  const lastFetchRef = useRef<number>(0)
+
+  // SSE for immediacy, with the same endpoint as a polling fallback. Only the
+  // room filter is applied client-side because it is what scopes the stream;
+  // event type stays server-side so the query stays indexed.
+  const { events: streamed, connected } = useEventStream(roomFilter)
 
   const fetchLogs = useCallback(async () => {
     try {
@@ -70,30 +75,18 @@ export function LogsView() {
     return () => {}
   }, [fetchLogs])
 
+  // Merge in anything that arrived over SSE since the last fetch. Pausing
+  // freezes the view without closing the stream, so resuming catches up rather
+  // than showing a gap.
   useEffect(() => {
-    if (paused) return
-    const id = setInterval(async () => {
-      const now = Date.now()
-      if (now - lastFetchRef.current < 2500) return
-      lastFetchRef.current = now
-      try {
-        const params = new URLSearchParams()
-        params.set("limit", "300")
-        if (roomFilter !== "all") params.set("room", roomFilter)
-        if (eventTypeFilter !== "all") params.set("type", eventTypeFilter)
-
-        const res = await fetch(`/api/events?${params}`)
-        if (res.ok) {
-          const data = await res.json()
-          setLogs(data.events || [])
-          setFilters(data.filters || { rooms: [], participants: [], eventTypes: [] })
-        }
-      } catch (err) {
-        console.error('Failed to fetch logs:', err)
-      }
-    }, 3000)
-    return () => clearInterval(id)
-  }, [paused, roomFilter, eventTypeFilter])
+    if (paused || streamed.length === 0) return
+    setLogs((prev) => {
+      const seen = new Set(prev.map((l) => l.id))
+      const merged = [...prev, ...streamed.filter((l) => !seen.has(l.id))]
+      merged.sort((a, b) => b.createdAt - a.createdAt)
+      return merged
+    })
+  }, [streamed, paused])
 
   const filtered = useMemo(() => {
     return logs.filter((l) => {
@@ -152,7 +145,7 @@ export function LogsView() {
         setLogs([])
         toast.success("Logs cleared")
       }
-    } catch (err) {
+    } catch (_err) {
       toast.error("Failed to clear logs")
     }
   }
@@ -280,7 +273,9 @@ export function LogsView() {
             <span className="size-2.5 rounded-full bg-warning/70" />
             <span className="size-2.5 rounded-full bg-success/70" />
           </div>
-          <span className="text-[11px] font-mono text-muted-foreground">livekit-server.log — streaming {paused ? "paused" : "live"}</span>
+          <span className="text-[11px] font-mono text-muted-foreground">
+            livekit-server.log — {paused ? "paused" : connected ? "live" : "polling (stream down)"}
+          </span>
           <span className="ms-auto text-[11px] font-mono text-muted-foreground">{filtered.length} lines</span>
         </div>
         <div ref={containerRef} className="font-mono text-xs h-[520px] overflow-auto scrollbar-thin p-4 space-y-0.5 bg-background/40">

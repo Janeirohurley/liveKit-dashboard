@@ -15,17 +15,28 @@
 pnpm install
 
 # 2. Configure environment
-cp .env.local.example .env.local
-# Edit .env.local with your LiveKit credentials
+cp .env.local.example .env
+# Edit .env: LiveKit credentials, DATABASE_URL, and
+# DASHBOARD_SESSION_SECRET (generate one with: openssl rand -hex 32)
 
 # 3. Start LiveKit server (in a separate terminal)
 cd livekit-server && docker compose up
 
-# 4. Start the dev server
+# 4. Create the schema
+pnpm db:migrate
+
+# 5. Create an admin account (prompts for email and password)
+pnpm admin:create
+
+# 6. Start the dev server
 pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Use any credentials to log in.
+Open [http://localhost:3000](http://localhost:3000) and sign in with the admin you
+created. There is no demo mode: authentication is required, and the API routes
+return `401` without a session.
+
+Migrations are idempotent, so `pnpm db:migrate` is safe to re-run.
 
 ## Development Workflow
 
@@ -125,24 +136,35 @@ Create a route file at `app/api/your-endpoint/route.ts`:
 
 ```typescript
 // app/api/your-endpoint/route.ts
-import { NextResponse } from "next/server"
-import { isLiveKitConfigured, getRoomService } from "@/lib/livekit-server"
+import { NextRequest, NextResponse } from "next/server"
+import { authenticate } from "@/lib/auth/session"
+import { audit } from "@/lib/auth/audit"
+import { getLiveKitAdapter } from "@/lib/livekit/adapter"
 
 export const dynamic = "force-dynamic"
 export const runtime = "nodejs"
 
-export async function GET() {
-  if (!isLiveKitConfigured()) {
-    return NextResponse.json(
-      { error: "LiveKit is not configured." },
-      { status: 400 }
-    )
-  }
+export async function GET(req: NextRequest) {
+  // Every route outside the public list authenticates first. Sessions live in
+  // Postgres, so this is a database read per request — not a middleware check.
+  const identity = await authenticate(req.headers)
+  if (!identity) return NextResponse.json({ error: "unauthorized" }, { status: 401 })
 
   try {
-    const svc = getRoomService()
-    // ... your logic
-    return NextResponse.json({ data: result })
+    // Read through the adapter rather than the SDK client directly, so DTOs stay
+    // in one place and raw SDK types do not leak into the browser bundle.
+    const rooms = await getLiveKitAdapter().listRooms()
+
+    // Mutating or sensitive reads are recorded against the real operator.
+    await audit({
+      adminId: identity.id,
+      adminEmail: identity.email,
+      action: "room.list",
+      targetType: "room",
+      targetId: null,
+    })
+
+    return NextResponse.json({ rooms })
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Unknown error" },
@@ -151,6 +173,20 @@ export async function GET() {
   }
 }
 ```
+
+Public routes, which must authenticate for themselves because callers have no
+session yet or are external systems:
+
+| Route | Why it is public |
+| --- | --- |
+| `POST /api/auth/login` | Mints the session |
+| `POST /api/auth/logout` | Idempotent with no session; clears the cookie |
+| `GET /api/health` | Liveness for the load balancer |
+| `POST /api/webhooks/livekit` | Signed webhook, verified against the API secret |
+
+Request bodies are validated before they reach business logic. A malformed body
+is the caller's mistake, so return `400` rather than letting it throw into the
+`500` branch — see `app/api/tokens/route.ts` for the pattern.
 
 ### Step 2: Create a Hook (Optional)
 
@@ -357,59 +393,40 @@ useEffect(() => {
 ### Required Variables
 
 ```env
+# LiveKit cluster credentials. Anything holding these can create rooms, mint
+# participant tokens, and read every room on the deployment.
 LIVEKIT_URL=http://localhost:7880
 LIVEKIT_API_KEY=devkey
 LIVEKIT_API_SECRET=secret
+
+# PostgreSQL: admins, sessions, audit log, webhook events, metrics history.
+# Without it there are no accounts, so nothing is reachable.
+DATABASE_URL=postgres://livekit:livekit@localhost:5432/livekit_dashboard
+
+# HMAC key for session cookies and webhook signature verification.
+# Generate per environment: openssl rand -hex 32
+DASHBOARD_SESSION_SECRET=replace-with-a-32-byte-random-hex-string
 ```
+
+`pnpm dev` refuses to be useful without these three groups: the app serves, but
+nothing authenticates.
 
 ### Optional Variables
 
 ```env
 LIVEKIT_REGION=auto
+
+# Prometheus endpoint. When unset, the monitoring and dashboard pages report
+# "n/a" for every metric. Nothing is substituted.
+LIVEKIT_METRICS_URL=http://localhost:9090/metrics
 ```
 
 ### Adding New Variables
 
-1. Add to `.env.local.example` with a comment
-2. Access via `process.env.VARIABLE_NAME`
-3. Add to `LiveKitConfig` interface if related to LiveKit
-
-## Testing
-
-There are **no tests** in this repository. To add testing:
-
-### Unit Tests
-
-```sh
-pnpm add -D vitest @testing-library/react @testing-library/jest-dom
-```
-
-Create `vitest.config.ts`:
-
-```typescript
-import { defineConfig } from 'vitest/config'
-
-export default defineConfig({
-  test: {
-    environment: 'jsdom',
-    setupFiles: ['./tests/setup.ts'],
-  },
-})
-```
-
-### API Route Tests
-
-Test API routes by importing the route handlers directly:
-
-```typescript
-import { GET, POST } from './app/api/rooms/route'
-
-test('GET /api/rooms returns rooms', async () => {
-  const response = await GET()
-  const data = await response.json()
-  expect(data.rooms).toBeDefined()
-})
-```
+1. Add to `.env.local.example` with a comment explaining what breaks without it
+2. Access via `process.env.VARIABLE_NAME`, or add an accessor to `lib/env.ts` when
+   the value needs a default
+3. Document it in `docs/api-reference.md` if it changes an API response
 
 ## Debugging
 
@@ -428,15 +445,30 @@ export async function GET() {
 
 ### Check LiveKit Connection
 
-Visit `/api/config` directly in the browser to see connection status:
+`/api/config` reports cluster reachability, but it is authenticated — open it
+from a signed-in browser tab, or with a session cookie:
+
+```sh
+curl -b cookies.txt http://localhost:3000/api/config
+```
 
 ```json
 {
   "configured": true,
+  "url": "http://localhost:7880",
+  "hasApiKey": true,
+  "hasApiSecret": true,
+  "region": "auto",
   "connectionStatus": "connected",
-  "roomCount": 3
+  "roomCount": 3,
+  "error": null
 }
 ```
+
+`connectionStatus` is one of `connected`, `error`, `not_configured`, or
+`unknown`, and the sidebar status box renders from this response. For a broader
+view use `GET /api/health`, which is public and also reports the dashboard's own
+Postgres and event-stream state.
 
 ### Docker Logs
 
@@ -444,31 +476,86 @@ Visit `/api/config` directly in the browser to see connection status:
 cd livekit-server && docker compose logs -f livekit
 ```
 
+## Testing
+
+```sh
+pnpm test          # offline suite
+pnpm test:watch    # watch mode
+```
+
+The suite runs fully offline by default: `vitest.config.mts` injects placeholder
+credentials so token tests can sign JWTs without a cluster or a database.
+
+Two suites opt into real dependencies, and both read your `.env` rather than
+placeholders:
+
+```sh
+LIVEKIT_E2E=1 pnpm test   # adapter against a running LiveKit server
+DB_E2E=1 pnpm test        # event store and snapshots against a real Postgres
+```
+
+What to add tests for:
+
+- Grant and claim mapping in `createAccessToken`. Assert on the decoded JWT, not
+  on the object passed in, so a grant dropped anywhere before the signature
+  fails the test.
+- Aggregation and gap semantics in `lib/metrics/store.ts` — in particular that
+  an unavailable sample stays `null` and is not bridged.
+- Anything where a silent fallback would be worse than a visible error.
+
 ## Common Issues
 
 ### "LiveKit is not configured"
 
-1. Verify `.env.local` exists (not just `.env.local.example`)
+1. Verify `.env` exists (not just `.env.local.example`)
 2. Check that `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` are set
 3. Restart the dev server after changing env vars
 
 ### CORS Errors
 
-API routes run server-side, so CORS is not an issue for internal fetches. If calling from an external domain, configure CORS in the route:
+Browser-to-route requests from a different origin need CORS headers. Do **not**
+add `Access-Control-Allow-Origin: *` to a dashboard route: every route except
+the four public ones authenticates, and a wildcard origin lets any site read
+`/api/rooms` or `/api/tokens` for whoever is signed in.
+
+Prefer same-origin deployment (serve the console under the same host as the
+dashboard, or reverse-proxy `/api` to it) so no CORS headers are needed at all.
+
+For the genuinely cross-origin case, echo back only origins you control:
 
 ```typescript
-return NextResponse.json(data, {
-  headers: { 'Access-Control-Allow-Origin': '*' }
-})
+const ALLOWED_ORIGINS = new Set(["https://console.yourdomain.com"])
+
+function corsHeaders(req: NextRequest): Record<string, string> {
+  const origin = req.headers.get("origin")
+  // Absent origin = same-origin or a non-browser client; nothing to allow.
+  if (!origin || !ALLOWED_ORIGINS.has(origin)) return {}
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Credentials": "true",
+    Vary: "Origin",
+  }
+}
 ```
 
-### TypeScript Errors in Editor
+Note that `Access-Control-Allow-Credentials: true` cannot be combined with a
+wildcard origin, and the session cookie is `SameSite=Lax`, so a cross-site
+credentialed request will not carry it anyway. Cross-origin use is limited to
+unauthenticated endpoints until the cookie policy is revisited.
 
-The project has `ignoreBuildErrors: true` in `next.config.mjs`. Editor TypeScript errors are still valid and should be addressed. Common issues:
+### TypeScript Errors
+
+`next.config.mjs` sets `typescript.ignoreBuildErrors: false`, so `pnpm build`
+fails on a type error rather than shipping it. Run `npx tsc --noEmit` for a
+faster loop than a full build.
+
+Common issues:
 
 - Missing type definitions for API responses
 - `bigint` to `number` conversions
 - Optional chaining on SDK types
+- Number strings arriving from JSON or the DOM — `creationTimeMs` is a string,
+  so it needs `Number(...)` before arithmetic
 
 ### Hot Reload Not Working
 
@@ -478,17 +565,21 @@ The project has `ignoreBuildErrors: true` in `next.config.mjs`. Editor TypeScrip
 
 ## Deployment
 
-### Vercel (Recommended)
+### Hosting
 
-```sh
-vercel deploy
-```
+This app is not well suited to serverless platforms: every authenticated
+request opens a Postgres connection and `GET /api/events` holds an SSE stream
+open, which a function with a request timeout will cut. Deploy it as a
+long-running Node process with Postgres reachable from it.
 
-Set environment variables in the Vercel dashboard:
-- `LIVEKIT_URL`
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
-- `LIVEKIT_REGION`
+Required environment variables:
+- `DATABASE_URL`
+- `DASHBOARD_SESSION_SECRET` (`openssl rand -hex 32`)
+- `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- `LIVEKIT_METRICS_URL` for the monitoring page (leave unset to disable it)
+
+Run `pnpm db:migrate` and `pnpm admin:create` against the target database as a
+release step, before starting the new version.
 
 ### Docker
 

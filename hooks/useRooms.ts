@@ -1,10 +1,10 @@
 'use client'
 
 import { useEffect, useState, useCallback, useRef } from 'react'
-import type { Room } from '@/lib/mock-data'
+import type { RoomDTO } from '@/lib/livekit/adapter'
 
 interface UseRoomsReturn {
-  rooms: Room[]
+  rooms: RoomDTO[]
   loading: boolean
   error: string | null
   refetch: () => Promise<void>
@@ -13,7 +13,7 @@ interface UseRoomsReturn {
 const POLLING_INTERVAL = 4000
 
 export function useRooms(): UseRoomsReturn {
-  const [rooms, setRooms] = useState<Room[]>([])
+  const [rooms, setRooms] = useState<RoomDTO[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -27,11 +27,11 @@ export function useRooms(): UseRoomsReturn {
       const res = await fetch('/api/rooms', { signal })
       if (signal.aborted) return
       if (!res.ok) {
-        const data = await res.json()
+        const data = await res.json().catch(() => ({}))
         throw new Error(data.error || `HTTP ${res.status}`)
       }
       const data = await res.json()
-      if (!signal.aborted) setRooms(data.rooms || [])
+      if (!signal.aborted) setRooms(data.rooms ?? [])
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return
       if (!signal.aborted) {

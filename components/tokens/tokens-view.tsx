@@ -1,14 +1,12 @@
 "use client"
 
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import { 
   Copy, 
   KeyRound, 
   Eye, 
   EyeOff, 
   RefreshCw, 
-  QrCode, 
-  Share2, 
   Sparkles,
   ChevronUp,
   ChevronDown
@@ -22,10 +20,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useI18n } from "@/lib/i18n"
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
+import type { TokenGrants } from "@/lib/livekit-server"
+import { formatUptime } from "@/lib/metrics/format"
 
 const TOKEN_TYPES = ["viewer", "publisher", "admin", "custom"] as const
 type TokenType = typeof TOKEN_TYPES[number]
 
+/** Mirrors TokenGrants in lib/livekit-server.ts. */
 interface AdvancedGrants {
   canPublish: boolean
   canSubscribe: boolean
@@ -42,18 +43,27 @@ interface AdvancedGrants {
   sipCall: boolean
 }
 
-export function TokensView() {
-  const { t } = useI18n()
-  const [type, setType] = useState<TokenType>("publisher")
-  const [room, setRoom] = useState("webinar-product-launch")
-  const [identity, setIdentity] = useState("user_8f2a1b")
-  const [exp, setExp] = useState("3600")
-  const [metadata, setMetadata] = useState('{"name":"Operator","tier":"pro"}')
-  const [perms, setPerms] = useState<AdvancedGrants>({
-    publish: true,
-    subscribe: true,
-    data: true,
-    recorder: false,
+/** The presets are the point: each one is a complete grant set, not a delta. */
+const PRESETS: Record<Exclude<TokenType, "custom">, AdvancedGrants> = {
+  viewer: {
+    canPublish: false,
+    canSubscribe: true,
+    canPublishData: false,
+    canPublishSources: [],
+    canUpdateOwnMetadata: false,
+    hidden: false,
+    roomCreate: false,
+    roomList: false,
+    roomAdmin: false,
+    roomRecord: false,
+    ingressAdmin: false,
+    sipAdmin: false,
+    sipCall: false,
+  },
+  publisher: {
+    canPublish: true,
+    canSubscribe: true,
+    canPublishData: true,
     canPublishSources: ["camera", "microphone"],
     canUpdateOwnMetadata: false,
     hidden: false,
@@ -63,17 +73,78 @@ export function TokensView() {
     roomRecord: false,
     ingressAdmin: false,
     sipAdmin: false,
-    sipCall: false
-  })
+    sipCall: false,
+  },
+  admin: {
+    canPublish: true,
+    canSubscribe: true,
+    canPublishData: true,
+    canPublishSources: ["camera", "microphone", "screen_share", "screen_share_audio"],
+    canUpdateOwnMetadata: true,
+    hidden: false,
+    roomCreate: true,
+    roomList: true,
+    roomAdmin: true,
+    roomRecord: true,
+    ingressAdmin: true,
+    sipAdmin: true,
+    sipCall: true,
+  },
+}
+
+export function TokensView() {
+  const { t } = useI18n()
+  const [type, setType] = useState<TokenType>("publisher")
+  const [room, setRoom] = useState("webinar-product-launch")
+  const [identity, setIdentity] = useState("user_8f2a1b")
+  const [exp, setExp] = useState("3600")
+  const [metadata, setMetadata] = useState('{"name":"Operator","tier":"pro"}')
+  const [perms, setPerms] = useState<AdvancedGrants>(PRESETS.publisher)
   const [token, setToken] = useState("")
   const [reveal, setReveal] = useState(true)
   const [loading, setLoading] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
 
+  /**
+   * Decode what the server actually issued rather than reconstructing the claims
+   * from the form — a guess would drift from the real token the moment a grant
+   * changes, which is the one thing this panel exists to check.
+   */
+  const decoded = useMemo<Record<string, unknown> | null>(() => {
+    if (!token || !reveal) return null
+    try {
+      const payload = token.split(".")[1]
+      const json = payload.replace(/-/g, "+").replace(/_/g, "/")
+      return JSON.parse(atob(json))
+    } catch {
+      return null
+    }
+  }, [token, reveal])
+
   async function generate() {
     setLoading(true)
     try {
-      const grants = {
+      // Metadata is free-form JSON handed to the participant on join. Validate it
+      // here so a typo is a field error rather than a server 500.
+      const trimmed = metadata.trim()
+      let parsedMetadata: { name?: unknown } = {}
+      if (trimmed) {
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(trimmed)
+        } catch {
+          throw new Error(t("tokens.invalidMetadata"))
+        }
+        // Any valid JSON parses, so `null`, `42` and `"x"` all reach here.
+        // Reading `.name` off a primitive would throw an opaque TypeError that
+        // surfaced as a generic failure, so reject non-objects explicitly.
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          throw new Error(t("tokens.invalidMetadata"))
+        }
+        parsedMetadata = parsed as { name?: unknown }
+      }
+
+      const grants: TokenGrants = {
         identity,
         room: room || undefined,
         canPublish: perms.canPublish,
@@ -87,29 +158,35 @@ export function TokensView() {
         roomAdmin: perms.roomAdmin,
         roomRecord: perms.roomRecord,
         ingressAdmin: perms.ingressAdmin,
+        sipAdmin: perms.sipAdmin,
+        sipCall: perms.sipCall,
         ttlSeconds: Number(exp),
-        name: JSON.parse(metadata).name || undefined,
+        name: typeof parsedMetadata.name === "string" ? parsedMetadata.name : undefined,
+        metadata: trimmed || undefined,
       }
 
-      // Remove undefined values
-      Object.keys(grants).forEach(key => grants[key] === undefined && delete grants[key])
+      // LiveKit reads an absent grant as "default", so keys the operator did not
+      // set are dropped rather than sent as null.
+      const body = Object.fromEntries(
+        Object.entries(grants).filter(([, v]) => v !== undefined),
+      )
 
-      const res = await fetch('/api/tokens', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(grants),
+      const res = await fetch("/api/tokens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
       })
 
       if (!res.ok) {
-        const data = await res.json()
+        const data = await res.json().catch(() => ({}))
         throw new Error(data.error || `HTTP ${res.status}`)
       }
 
       const data = await res.json()
       setToken(data.token)
-      toast.success("Token generated")
+      toast.success(t("tokens.generated"))
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to generate token")
+      toast.error(err instanceof Error ? err.message : t("tokens.generateFailed"))
     } finally {
       setLoading(false)
     }
@@ -133,69 +210,12 @@ export function TokensView() {
                    key={tt}
                    type="button"
                    onClick={() => {
-                     setType(tt);
-                     // Auto-show advanced permissions for custom type
+                     setType(tt)
                      if (tt === "custom") {
-                       setShowAdvanced(true);
+                       setShowAdvanced(true)
                      } else {
-                       // Hide advanced permissions for preset types
-                       setShowAdvanced(false);
-                       // Reset to preset values
-                       if (tt === "viewer") {
-                         setPerms({
-                           ...perms,
-                           canPublish: false,
-                           canSubscribe: true,
-                           canPublishData: false,
-                           recorder: false,
-                           canPublishSources: [],
-                           canUpdateOwnMetadata: false,
-                           hidden: false,
-                           roomCreate: false,
-                           roomList: false,
-                           roomAdmin: false,
-                           roomRecord: false,
-                           ingressAdmin: false,
-                           sipAdmin: false,
-                           sipCall: false
-                         });
-                       } else if (tt === "publisher") {
-                         setPerms({
-                           ...perms,
-                           canPublish: true,
-                           canSubscribe: true,
-                           canPublishData: true,
-                           recorder: false,
-                           canPublishSources: ["camera", "microphone"],
-                           canUpdateOwnMetadata: false,
-                           hidden: false,
-                           roomCreate: false,
-                           roomList: false,
-                           roomAdmin: false,
-                           roomRecord: false,
-                           ingressAdmin: false,
-                           sipAdmin: false,
-                           sipCall: false
-                         });
-                       } else if (tt === "admin") {
-                         setPerms({
-                           ...perms,
-                           canPublish: true,
-                           canSubscribe: true,
-                           canPublishData: true,
-                           recorder: true,
-                           canPublishSources: ["camera", "microphone", "screen_share", "screen_share_audio"],
-                           canUpdateOwnMetadata: true,
-                           hidden: false,
-                           roomCreate: true,
-                           roomList: true,
-                           roomAdmin: true,
-                           roomRecord: true,
-                           ingressAdmin: true,
-                           sipAdmin: true,
-                           sipCall: true
-                         });
-                       }
+                       setShowAdvanced(false)
+                       setPerms(PRESETS[tt])
                      }
                    }}
                    className={cn(
@@ -334,31 +354,24 @@ export function TokensView() {
                        <label className="flex items-center gap-2 text-xs">
                          <Switch
                            checked={perms.roomCreate}
-                           onChange={(v) => setPerms({ ...perms, roomCreate: v })}
+                           onCheckedChange={(v) => setPerms({ ...perms, roomCreate: v })}
                          />
                          <span>{t("tokens.roomCreate")}</span>
                        </label>
                        <label className="flex items-center gap-2 text-xs">
                          <Switch
                            checked={perms.roomList}
-                           onChange={(v) => setPerms({ ...perms, roomList: v })}
+                           onCheckedChange={(v) => setPerms({ ...perms, roomList: v })}
                          />
                          <span>{t("tokens.roomList")}</span>
                        </label>
-                       <label className="flex items-center gap-2 text-xs">
-                         <Switch
-                           checked={perms.roomAdmin}
-                           onChange={(v) => setPerms({ ...perms, roomAdmin: v })}
-                         />
-                         <span>{t("tokens.roomAdmin")}</span>
-                       </label>
-                       <label className="flex items-center gap-2 text-xs">
-                         <Switch
-                           checked={perms.roomRecord}
-                           onChange={(v) => setPerms({ ...perms, roomRecord: v })}
-                         />
-                         <span>{t("tokens.roomRecord")}</span>
-                       </label>
+<label className="flex items-center gap-2 text-xs">
+                          <Switch
+                            checked={perms.roomAdmin}
+                            onCheckedChange={(v) => setPerms({ ...perms, roomAdmin: v })}
+                          />
+                          <span>{t("tokens.roomAdmin")}</span>
+                        </label>
                      </div>
                    </div>
                    
@@ -368,14 +381,14 @@ export function TokensView() {
                        <label className="flex items-center gap-2 text-xs">
                          <Switch
                            checked={perms.sipAdmin}
-                           onChange={(v) => setPerms({ ...perms, sipAdmin: v })}
+                           onCheckedChange={(v) => setPerms({ ...perms, sipAdmin: v })}
                          />
                          <span>{t("tokens.sipAdmin")}</span>
                        </label>
                        <label className="flex items-center gap-2 text-xs">
                          <Switch
                            checked={perms.sipCall}
-                           onChange={(v) => setPerms({ ...perms, sipCall: v })}
+                           onCheckedChange={(v) => setPerms({ ...perms, sipCall: v })}
                          />
                          <span>{t("tokens.sipCall")}</span>
                        </label>
@@ -387,7 +400,7 @@ export function TokensView() {
            </div>
 
            <Button onClick={generate} size="lg" className="w-full" disabled={loading}>
-             {loading ? "Generating..." : <Sparkles className="size-4" /> }
+             {loading ? t("tokens.generating") : <Sparkles className="size-4" />}
              {t("tokens.generate")}
            </Button>
         </div>
@@ -401,8 +414,8 @@ export function TokensView() {
                   <KeyRound className="size-4 text-primary" />
                 </div>
                 <div>
-                  <div className="text-sm font-semibold">JWT Token</div>
-                  <div className="text-[11px] text-muted-foreground">HS256 • {exp}s expiry</div>
+                  <div className="text-sm font-semibold">{t("tokens.jwt")}</div>
+                  <div className="text-[11px] text-muted-foreground">HS256 • {t("tokens.expiryLabel")} {formatUptime(Number(exp))}</div>
                 </div>
               </div>
               <Button variant="ghost" size="icon" onClick={() => setReveal((v) => !v)} aria-label="toggle reveal">
@@ -424,66 +437,49 @@ export function TokensView() {
                   "•".repeat(180)
                 )
               ) : (
-                <span className="text-muted-foreground italic">Click generate to issue a signed token</span>
+                <span className="text-muted-foreground italic">{t("tokens.issueHint")}</span>
               )}
             </div>
 
-            <div className="grid grid-cols-3 gap-2">
-              <Button variant="outline" disabled={!token} onClick={() => { navigator.clipboard.writeText(token).catch(() => toast.error("Failed to copy")); toast.success(t("common.copied")) }}>
-                <Copy className="size-4" /> {t("common.copy")}
-              </Button>
-              <Button variant="outline" disabled={!token}>
-                <QrCode className="size-4" /> {t("tokens.qr")}
-              </Button>
-              <Button variant="outline" disabled={!token}>
-                <Share2 className="size-4" /> {t("tokens.share")}
+            <div className="grid grid-cols-1 gap-2">
+              <Button
+                variant="outline"
+                disabled={!token}
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(token)
+                    toast.success(t("common.copied"))
+                  } catch {
+                    toast.error(t("tokens.copyFailed"))
+                  }
+                }}
+              >
+                <Copy className="size-4" /> {t("tokens.copyToken")}
               </Button>
             </div>
 
             <Button variant="ghost" size="sm" onClick={generate} className="w-full text-muted-foreground">
-              <RefreshCw className="size-3.5" /> Regenerate
+              <RefreshCw className="size-3.5" /> {t("tokens.regenerate")}
             </Button>
           </div>
 
            <div className="rounded-2xl bg-card ring-1 ring-border p-5 text-xs">
-             <div className="font-semibold mb-2">Decoded payload</div>
-             {token && !reveal ? (
-               <span className="text-muted-foreground italic">Click to reveal token details</span>
-             ) : token && reveal ? (
+             <div className="flex items-center justify-between mb-2">
+               <span className="font-semibold">{t("tokens.decodedPayload")}</span>
+               {typeof decoded?.exp === "number" && (
+                 <span className="text-muted-foreground">
+                   {t("tokens.expires")} {new Date(decoded.exp * 1000).toLocaleString()}
+                 </span>
+               )}
+             </div>
+             {decoded ? (
                <pre className="font-mono text-[11px] text-muted-foreground bg-background ring-1 ring-border rounded-xl p-3 overflow-auto scrollbar-thin">
-                 {JSON.stringify(
-                   {
-                     iss: process.env.LIVEKIT_API_KEY,
-                     sub: identity,
-                     exp: Math.floor(Date.now() / 1000) + Number(exp),
-                     nbf: Math.floor(Date.now() / 1000),
-                     video: {
-                       roomJoin: true,
-                       room: room || "",
-                       canPublish: perms.canPublish,
-                       canSubscribe: perms.canSubscribe,
-                       canPublishData: perms.canPublishData,
-                       canPublishSources: perms.canPublishSources.length > 0 ? perms.canPublishSources : undefined,
-                       canUpdateOwnMetadata: perms.canUpdateOwnMetadata,
-                       hidden: perms.hidden,
-                       roomCreate: perms.roomCreate,
-                       roomList: perms.roomList,
-                       roomAdmin: perms.roomAdmin,
-                       roomRecord: perms.roomRecord,
-                       ingressAdmin: perms.ingressAdmin,
-                       sip: perms.sipAdmin || perms.sipCall ? {
-                         admin: perms.sipAdmin,
-                         call: perms.sipCall
-                       } : undefined
-                     },
-                     metadata: JSON.parse(metadata),
-                   },
-                   null,
-                   2
-                 )}
+                 {JSON.stringify(decoded, null, 2)}
                </pre>
              ) : (
-               <span className="text-muted-foreground italic">Click generate to issue a signed token</span>
+               <span className="text-muted-foreground italic">
+                 {token && !reveal ? t("tokens.revealToDecode") : t("tokens.noPayload")}
+               </span>
              )}
            </div>
         </div>

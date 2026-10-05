@@ -10,7 +10,29 @@ services:
     # network_mode: host
   livekit:
     image: livekit/livekit-server
+    # Prometheus is DISABLED by default in livekit-server (`--prometheus_port`
+    # defaults to 0, see `livekit-server help-verbose`). Without it the
+    # dashboard has no real source for its metrics section.
+    # Set through the env var rather than a CLI flag: this generated flag only
+    # accepts the UNDERSCORE spelling --prometheus_port, and passing the dashed
+    # --prometheus-port makes the server exit with
+    # "flag provided but not defined" (verified on 1.13.7).
+    # /metrics listens on every interface because this service uses
+    # network_mode: host — see docs/architecture.md.
     command: --dev --redis-host localhost:6379
+    environment:
+      LIVEKIT_PROMETHEUS_PORT: "9090"
+      # Point the dev server at the dashboard's webhook receiver so the event
+      # log is fed by the real server rather than by hand-signed probes.
+      # This service uses network_mode: host, so localhost is the host, where
+      # `pnpm dev` / `pnpm start` listens on 3000.
+      # Without this the dashboard has no events at all in dev, since no
+      # endpoint exists on a stock LiveKit server to read them from.
+      LIVEKIT_CONFIG: |
+        webhook:
+          api_key: devkey
+          urls:
+            - http://localhost:3000/api/webhooks/livekit
     network_mode: host
     depends_on:
         redis:

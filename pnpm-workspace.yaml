@@ -1,0 +1,10 @@
+allowBuilds:
+  # Ship the esbuild binary that tsx and Vitest run on. Without it
+  # `pnpm db:migrate` / `pnpm admin:create` / `pnpm test` cannot start, and
+  # pnpm refuses every install with ERR_PNPM_IGNORED_BUILDS.
+  esbuild: true
+  # Native optional dependency used by Next.js image optimization. Its
+  # install script builds the prebuilt binary, so it must be allowed or pnpm
+  # aborts every `pnpm add` with ERR_PNPM_IGNORED_BUILDS.
+  sharp: true
+  unrs-resolver: set this to true or false

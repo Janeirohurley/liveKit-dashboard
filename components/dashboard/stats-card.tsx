@@ -9,8 +9,11 @@ export type StatsCardProps = {
   value: string | number
   hint?: string
   icon?: LucideIcon
-  trend?: number // percentage; positive = up
-  accent?: "primary" | "blue" | "amber" | "rose" | "default"
+  /** Percentage change, positive = up. Omit rather than pass 0 for "no data". */
+  trend?: number
+  /** Replaces the default "vs last hour" caption. */
+  trendLabel?: string
+  accent?: "primary" | "blue" | "amber" | "rose" | "destructive" | "default"
   className?: string
 }
 
@@ -19,10 +22,20 @@ const accents: Record<NonNullable<StatsCardProps["accent"]>, string> = {
   blue: "text-chart-2 bg-chart-2/10 ring-chart-2/20",
   amber: "text-warning bg-warning/10 ring-warning/20",
   rose: "text-destructive bg-destructive/10 ring-destructive/20",
+  destructive: "text-destructive bg-destructive/10 ring-destructive/20",
   default: "text-foreground bg-accent ring-border",
 }
 
-export function StatsCard({ label, value, hint, icon: Icon, trend, accent = "primary", className }: StatsCardProps) {
+export function StatsCard({
+  label,
+  value,
+  hint,
+  icon: Icon,
+  trend,
+  trendLabel,
+  accent = "primary",
+  className,
+}: StatsCardProps) {
   const up = (trend ?? 0) >= 0
   return (
     <div
@@ -55,7 +68,7 @@ export function StatsCard({ label, value, hint, icon: Icon, trend, accent = "pri
             {up ? <ArrowUpRight className="size-3" /> : <ArrowDownRight className="size-3" />}
             {Math.abs(trend).toFixed(1)}%
           </span>
-          <span className="text-muted-foreground">vs last hour</span>
+          <span className="text-muted-foreground">{trendLabel ?? "vs last hour"}</span>
         </div>
       )}
       <div className="pointer-events-none absolute -right-8 -top-8 size-32 rounded-full bg-primary/5 blur-2xl opacity-0 group-hover:opacity-100 transition-opacity" />

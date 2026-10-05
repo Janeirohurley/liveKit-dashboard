@@ -1,10 +1,10 @@
 'use client'
 
 import { useEffect, useState, useCallback, useRef } from 'react'
-import type { Participant } from '@/lib/mock-data'
+import type { ParticipantDTO } from '@/lib/livekit/adapter'
 
 interface UseParticipantsReturn {
-  participants: Participant[]
+  participants: ParticipantDTO[]
   loading: boolean
   error: string | null
   refetch: () => Promise<void>
@@ -12,8 +12,16 @@ interface UseParticipantsReturn {
 
 const POLLING_INTERVAL = 3000
 
+/**
+ * Live participant list for one room.
+ *
+ * Typed against the adapter's DTO rather than the old mock `Participant` shape:
+ * the server reports tracks and permissions, and it does not report per-participant
+ * RTT or packet loss. Those fields existed only in the mock, so anything rendering
+ * them was showing invented numbers.
+ */
 export function useParticipants(roomName: string | undefined): UseParticipantsReturn {
-  const [participants, setParticipants] = useState<Participant[]>([])
+  const [participants, setParticipants] = useState<ParticipantDTO[]>([])
   const [loading, setLoading] = useState(!roomName)
   const [error, setError] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -31,10 +39,10 @@ export function useParticipants(roomName: string | undefined): UseParticipantsRe
     try {
       setError(null)
       const encodedRoom = encodeURIComponent(roomName)
-      const res = await fetch(`/api/rooms/${encodedRoom}`, { signal })
+      const res = await fetch(`/api/rooms/${encodedRoom}/participants`, { signal })
       if (signal.aborted) return
       if (!res.ok) {
-        const data = await res.json()
+        const data = await res.json().catch(() => ({}))
         throw new Error(data.error || `HTTP ${res.status}`)
       }
       const data = await res.json()
