@@ -38,6 +38,30 @@ ENV NODE_ENV=production
 RUN pnpm build
 
 # ---------------------------------------------------------------------------
+# tools: source + dev dependencies, without the Next.js build. Used for the
+# one-shot jobs compose runs against the database:
+#
+#   db:migrate    creates dashboard_* tables (tsx lib/db/cli.ts)
+#   admin:create  provisions the first operator account
+#
+# It exists because `runner` deliberately ships no source and no dev tooling,
+# so the published runtime image CANNOT migrate itself. Without this stage a
+# fresh database stays empty and every sign-in fails on a missing table.
+#
+# Must stay BEFORE `runner`: the last stage is what `docker build` targets by
+# default, and that has to remain the runtime image.
+# ---------------------------------------------------------------------------
+FROM base AS tools
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+
+CMD ["pnpm", "db:migrate"]
+
+# ---------------------------------------------------------------------------
 # runner: ships only the standalone server, its traced dependencies and the
 # static assets. No install step, no source, no dev tooling.
 # ---------------------------------------------------------------------------

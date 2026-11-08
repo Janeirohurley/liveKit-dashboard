@@ -80,3 +80,39 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ---------------------------------------------------------------------
+      # Tooling image (`tools` stage): same source, but with dev dependencies
+      # and no Next.js build. It is what applies the database schema
+      # (`pnpm db:migrate`) and creates the first operator
+      # (`pnpm admin:create`).
+      #
+      # The runtime image above ships no source and no dev tooling, so it
+      # cannot do either. Published alongside it, with a `-tools` suffix:
+      #   ghcr.io/janeirohurley/livekit-dashboard:0.1.1-tools
+      #
+      # `scope` keeps this build's layer cache separate from the runtime
+      # build's, so the two do not evict each other on every run.
+      # ---------------------------------------------------------------------
+      - id: meta-tools
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha
+          flavor: |
+            latest=auto
+            suffix=-tools,onlatest=true
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: tools
+          push: true
+          tags: ${{ steps.meta-tools.outputs.tags }}
+          labels: ${{ steps.meta-tools.outputs.labels }}
+          cache-from: type=gha,scope=tools
+          cache-to: type=gha,mode=max,scope=tools
