@@ -7,4 +7,4 @@ allowBuilds:
   # install script builds the prebuilt binary, so it must be allowed or pnpm
   # aborts every `pnpm add` with ERR_PNPM_IGNORED_BUILDS.
   sharp: true
-  unrs-resolver: set this to true or false
+  unrs-resolver: true
