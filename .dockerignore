@@ -1,0 +1,62 @@
+# Dependencies / package manager
+node_modules
+.pnpm-store
+
+# Next.js
+.next
+out
+dist
+
+# Build / compilation caches
+coverage
+.turbo
+.cache
+*.tsbuildinfo
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Environment files — the .env in this repo holds LIVEKIT_API_SECRET and
+# DASHBOARD_SESSION_SECRET, so it must never reach the build context or a layer.
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Logs
+*.log
+logs
+
+# Tests
+test
+tests
+__tests__
+coverage
+
+# Local development / temporary files
+.tmp
+.temp
+tmp
+temp
+
+# IDE / editor
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+
+# Docker files
+Dockerfile
+.dockerignore
+docker-compose.yml
+compose.yml
+compose.yaml

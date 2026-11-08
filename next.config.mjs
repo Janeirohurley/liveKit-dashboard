@@ -9,6 +9,10 @@ const nextConfig = {
   images: {
     unoptimized: true,
   },
+  // Emit `.next/standalone`: a self-contained server with only the traced
+  // dependencies. The Docker runner stage copies it instead of reinstalling
+  // node_modules, which is what keeps the runtime image small.
+  output: "standalone",
 }
 
 export default nextConfig
